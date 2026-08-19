@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rgbd-confidence-pose"
+version = "0.1.0"
+description = "Confidence-aware RGB-D correspondence and SE(3) pose estimation"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "scipy>=1.10", "Pillow>=10"]
+
+[project.optional-dependencies]
+vision = ["opencv-python>=4.8"]
+dino = ["torch>=2.1", "torchvision>=0.16", "timm>=0.9"]
+realsense = ["pyrealsense2>=2.54"]
+viz = ["open3d>=0.18"]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

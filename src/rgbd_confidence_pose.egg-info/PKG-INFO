@@ -1,0 +1,20 @@
+Metadata-Version: 2.4
+Name: rgbd-confidence-pose
+Version: 0.1.0
+Summary: Confidence-aware RGB-D correspondence and SE(3) pose estimation
+Requires-Python: >=3.10
+Requires-Dist: numpy>=1.24
+Requires-Dist: scipy>=1.10
+Requires-Dist: Pillow>=10
+Provides-Extra: vision
+Requires-Dist: opencv-python>=4.8; extra == "vision"
+Provides-Extra: dino
+Requires-Dist: torch>=2.1; extra == "dino"
+Requires-Dist: torchvision>=0.16; extra == "dino"
+Requires-Dist: timm>=0.9; extra == "dino"
+Provides-Extra: realsense
+Requires-Dist: pyrealsense2>=2.54; extra == "realsense"
+Provides-Extra: viz
+Requires-Dist: open3d>=0.18; extra == "viz"
+Provides-Extra: dev
+Requires-Dist: pytest>=7; extra == "dev"

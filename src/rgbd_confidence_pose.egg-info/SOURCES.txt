@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+src/rgbd_confidence_pose.egg-info/PKG-INFO
+src/rgbd_confidence_pose.egg-info/SOURCES.txt
+src/rgbd_confidence_pose.egg-info/dependency_links.txt
+src/rgbd_confidence_pose.egg-info/requires.txt
+src/rgbd_confidence_pose.egg-info/top_level.txt
+src/rgbd_pose/__init__.py
+src/rgbd_pose/features.py
+src/rgbd_pose/geometry.py
+src/rgbd_pose/io.py
+src/rgbd_pose/matching.py
+src/rgbd_pose/pose.py
+tests/test_pose.py
