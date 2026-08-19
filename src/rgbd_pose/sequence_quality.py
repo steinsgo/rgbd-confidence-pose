@@ -12,11 +12,11 @@ import csv
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 import numpy as np
 
-from .features import extract_opencv_features
+from .features import extract_opencv_features, rectangular_roi_mask
 from .geometry import backproject_pixels
 from .matching import combine_confidence, mutual_nearest_matches
 from .pose import estimate_pose_ransac
@@ -192,13 +192,43 @@ def _pair_check(
     ransac_threshold_m: float,
     thresholds: QualityThresholds,
     issues: list[dict[str, Any]],
+    reference_roi: Sequence[int] | None = None,
+    query_roi: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     if backend != "sift":
         raise ValueError("The sequence quality gate currently supports only the SIFT backend")
 
     try:
-        reference_features = extract_opencv_features(reference.rgb, backend)
-        query_features = extract_opencv_features(query.rgb, backend)
+        reference_mask = rectangular_roi_mask(reference.rgb.shape, reference_roi)
+        query_mask = rectangular_roi_mask(query.rgb.shape, query_roi)
+    except ValueError as exc:
+        _issue(
+            issues,
+            "REJECT",
+            "roi_invalid",
+            f"The selected pair ROI is invalid: {exc}",
+            "pair",
+        )
+        result: dict[str, Any] = {
+            "status": "REJECT",
+            "backend": backend,
+            "reference_index": reference.frame_index,
+            "query_index": query.frame_index,
+            "error": str(exc),
+        }
+        if reference_roi is not None:
+            result["reference_roi_xyxy"] = list(reference_roi)
+        if query_roi is not None:
+            result["query_roi_xyxy"] = list(query_roi)
+        return result
+
+    try:
+        reference_features = extract_opencv_features(
+            reference.rgb, backend, mask=reference_mask
+        )
+        query_features = extract_opencv_features(
+            query.rgb, backend, mask=query_mask
+        )
     except (ImportError, RuntimeError) as exc:
         _issue(
             issues,
@@ -224,6 +254,10 @@ def _pair_check(
         "top_fraction": top_fraction,
         "ransac_threshold_m": ransac_threshold_m,
     }
+    if reference_roi is not None:
+        result["reference_roi_xyxy"] = list(reference_roi)
+    if query_roi is not None:
+        result["query_roi_xyxy"] = list(query_roi)
 
     if min(len(reference_features.uv), len(query_features.uv)) < thresholds.min_sift_features_reject:
         _issue(
@@ -370,6 +404,8 @@ def screen_realsense_session(
     thresholds: QualityThresholds | None = None,
     check_features: bool = True,
     full_scan: bool = False,
+    reference_roi: Sequence[int] | None = None,
+    query_roi: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     """Screen one recorded session without modifying it.
 
@@ -785,6 +821,8 @@ def screen_realsense_session(
             ransac_threshold_m,
             thresholds,
             issues,
+            reference_roi=reference_roi,
+            query_roi=query_roi,
         )
         pair_status = str(pair_check["status"])
 

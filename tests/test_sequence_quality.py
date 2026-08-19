@@ -134,3 +134,35 @@ def test_quality_report_rejects_missing_recorded_file(tmp_path):
 
     assert report["status"] == "REJECT"
     assert any(issue["code"] == "referenced_file_missing" for issue in report["issues"])
+
+
+def test_quality_report_rejects_invalid_pair_roi(tmp_path):
+    session = _write_quality_session(tmp_path)
+
+    report = screen_realsense_session(
+        session,
+        reference_index=0,
+        query_index=1,
+        check_features=False,
+        reference_roi=(0, 0, 0, 2),
+        query_roi=(0, 0, 2, 2),
+    )
+
+    assert report["pair_status"] == "REJECT"
+    assert any(issue["code"] == "roi_invalid" for issue in report["issues"])
+
+
+def test_quality_report_records_valid_pair_roi(tmp_path):
+    session = _write_quality_session(tmp_path)
+
+    report = screen_realsense_session(
+        session,
+        reference_index=0,
+        query_index=1,
+        check_features=False,
+        reference_roi=(0, 0, 2, 2),
+        query_roi=(0, 0, 2, 2),
+    )
+
+    assert report["pair_check"]["reference_roi_xyxy"] == [0, 0, 2, 2]
+    assert report["pair_check"]["query_roi_xyxy"] == [0, 0, 2, 2]

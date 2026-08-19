@@ -13,7 +13,11 @@ import numpy as np
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from rgbd_pose.features import extract_dinov2_patch_features, extract_opencv_features
+from rgbd_pose.features import (
+    extract_dinov2_patch_features,
+    extract_opencv_features,
+    rectangular_roi_mask,
+)
 from rgbd_pose.geometry import backproject_pixels, rotation_error_deg
 from rgbd_pose.io import load_rgbd_frame
 from rgbd_pose.matching import combine_confidence, mutual_nearest_matches
@@ -97,6 +101,17 @@ def _add_sequence_metadata(
         payload["query"] = _frame_payload(query_frame)
 
 
+def _add_roi_metadata(
+    payload: dict[str, object],
+    reference_roi: list[int] | None,
+    query_roi: list[int] | None,
+) -> None:
+    if reference_roi is not None:
+        payload["reference_roi_xyxy"] = reference_roi
+    if query_roi is not None:
+        payload["query_roi_xyxy"] = query_roi
+
+
 def _save_evidence(
     evidence_dir: Path,
     reference_rgb: np.ndarray,
@@ -148,6 +163,20 @@ def main() -> None:
     parser.add_argument("--min-similarity", type=float, default=0.55)
     parser.add_argument("--top-fraction", type=float, default=0.5)
     parser.add_argument("--ransac-threshold", type=float, default=0.03)
+    parser.add_argument(
+        "--reference-roi",
+        nargs=4,
+        type=int,
+        metavar=("X0", "Y0", "X1", "Y1"),
+        help="restrict OpenCV features to this reference image rectangle",
+    )
+    parser.add_argument(
+        "--query-roi",
+        nargs=4,
+        type=int,
+        metavar=("X0", "Y0", "X1", "Y1"),
+        help="restrict OpenCV features to this query image rectangle",
+    )
     parser.add_argument("--output", type=Path, default=Path("results/pair.json"))
     parser.add_argument("--evidence-dir", type=Path)
     args = parser.parse_args()
@@ -179,13 +208,24 @@ def main() -> None:
         ref_rgb, ref_depth, ref_k = load_rgbd_frame(args.reference)
         query_rgb, query_depth, query_k = load_rgbd_frame(args.query)
 
+    if args.backend == "dino" and (
+        args.reference_roi is not None or args.query_roi is not None
+    ):
+        parser.error("--reference-roi/--query-roi are supported only for SIFT or ORB")
+    reference_roi_mask = rectangular_roi_mask(ref_rgb.shape, args.reference_roi)
+    query_roi_mask = rectangular_roi_mask(query_rgb.shape, args.query_roi)
+
     started = time.perf_counter()
     if args.backend == "dino":
         ref_features = extract_dinov2_patch_features(ref_rgb)
         query_features = extract_dinov2_patch_features(query_rgb)
     else:
-        ref_features = extract_opencv_features(ref_rgb, args.backend)
-        query_features = extract_opencv_features(query_rgb, args.backend)
+        ref_features = extract_opencv_features(
+            ref_rgb, args.backend, mask=reference_roi_mask
+        )
+        query_features = extract_opencv_features(
+            query_rgb, args.backend, mask=query_roi_mask
+        )
     if len(ref_features.uv) < 3 or len(query_features.uv) < 3:
         raise SystemExit("Not enough visual features; use a textured object or a wider crop")
 
@@ -218,6 +258,7 @@ def main() -> None:
             "runtime_s": time.perf_counter() - started,
         }
         _add_sequence_metadata(failure_payload, args.session, reference_frame, query_frame)
+        _add_roi_metadata(failure_payload, args.reference_roi, args.query_roi)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(
             json.dumps(failure_payload, indent=2) + "\n", encoding="utf-8"
@@ -266,6 +307,7 @@ def main() -> None:
         "transform_reference_to_query": estimate.transform.tolist(),
     }
     _add_sequence_metadata(payload, args.session, reference_frame, query_frame)
+    _add_roi_metadata(payload, args.reference_roi, args.query_roi)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

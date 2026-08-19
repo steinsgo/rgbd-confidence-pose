@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 
@@ -9,6 +10,38 @@ import numpy as np
 class ImageFeatures:
     uv: np.ndarray
     descriptors: np.ndarray
+
+
+def rectangular_roi_mask(
+    image_shape: Sequence[int], roi_xyxy: Sequence[int] | None
+) -> np.ndarray | None:
+    """Build a boolean feature mask from ``(x0, y0, x1, y1)`` pixels.
+
+    The upper bounds are exclusive, matching NumPy slicing.  The mask is
+    intended for OpenCV feature extraction; it does not crop or alter the
+    image, so returned keypoint coordinates remain in full-image coordinates.
+    """
+    if roi_xyxy is None:
+        return None
+    if len(image_shape) < 2:
+        raise ValueError("image_shape must contain height and width")
+    if len(roi_xyxy) != 4:
+        raise ValueError("roi_xyxy must contain (x0, y0, x1, y1)")
+    try:
+        x0, y0, x1, y1 = (int(value) for value in roi_xyxy)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("roi_xyxy must contain integer coordinates") from exc
+    height, width = int(image_shape[0]), int(image_shape[1])
+    if height <= 0 or width <= 0:
+        raise ValueError("image_shape must have positive height and width")
+    if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+        raise ValueError(
+            f"ROI {(x0, y0, x1, y1)} must lie inside image bounds "
+            f"(0, 0, {width}, {height})"
+        )
+    mask = np.zeros((height, width), dtype=bool)
+    mask[y0:y1, x0:x1] = True
+    return mask
 
 
 def extract_opencv_features(
@@ -22,8 +55,19 @@ def extract_opencv_features(
         import cv2
     except ImportError as exc:
         raise RuntimeError("Install opencv-python for the OpenCV baseline") from exc
-    gray = cv2.cvtColor(np.asarray(image_rgb, np.uint8), cv2.COLOR_RGB2GRAY)
-    cv_mask = None if mask is None else (np.asarray(mask, bool).astype(np.uint8) * 255)
+    image = np.asarray(image_rgb, np.uint8)
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("image_rgb must have shape HxWx3")
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    if mask is None:
+        cv_mask = None
+    else:
+        mask_array = np.asarray(mask, bool)
+        if mask_array.shape != image.shape[:2]:
+            raise ValueError(
+                "feature mask must have the same height and width as image_rgb"
+            )
+        cv_mask = mask_array.astype(np.uint8) * 255
     if method.lower() == "sift":
         detector = cv2.SIFT_create(nfeatures=max_features)
     elif method.lower() == "orb":

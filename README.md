@@ -1,87 +1,256 @@
 # Confidence-Aware RGB-D Correspondence for Unseen Object Pose Estimation
 
-A small-scale independent study inspired by the confidence-aware correspondence idea in **COG**. The project estimates the relative SE(3) pose of an unseen object from two RGB-D views. Appearance confidence, mutual consistency, valid depth, and geometric RANSAC are combined instead of treating every visual match equally.
+Small, independent research code for matching an unseen object between two
+RGB-D observations, lifting correspondences into 3-D, and estimating a
+relative rigid transform. The project is inspired by the confidence-aware
+correspondence idea in COG, but is **not an exact reproduction of COG**.
 
-## Research question
-
-Can simple, interpretable confidence filtering make pretrained visual correspondences more reliable for RGB-D pose estimation under viewpoint change and partial overlap?
+The implementation is intentionally modest: OpenCV SIFT/ORB, explicit depth
+validity, heuristic appearance confidence, weighted Kabsch refinement, and
+confidence-biased RANSAC. The goal is a reproducible CPU-capable baseline that
+can be inspected before larger models or experiments are introduced.
 
 ## Pipeline
 
-1. Capture color-aligned RGB-D frames with an Intel RealSense D435i.
-2. Crop or mask the target object.
-3. Extract pretrained visual features (DINOv2 planned; SIFT/ORB baseline).
-4. Retain mutual nearest-neighbor matches and rank them by similarity confidence.
-5. Back-project matched pixels with depth and camera intrinsics.
-6. Estimate target-to-query SE(3) with confidence-weighted RANSAC and Kabsch refinement.
-7. Compare inlier ratio, registration RMSE, and pose error where ground truth is available.
+```mermaid
+flowchart LR
+    A[Windows D435i capture] --> B[Aligned RGB-D sequence]
+    B --> C[Read-only sequence adapter]
+    C --> D[RGB + depth + intrinsics]
+    D --> E[SIFT/ORB features]
+    E --> F[Mutual-NN matches]
+    F --> G[Appearance confidence]
+    D --> H[2D-to-3D back-projection]
+    G --> I[Confidence-aware 3D correspondences]
+    H --> I
+    I --> J[Weighted Kabsch + RANSAC]
+    J --> K[SE(3), inliers, RMSE]
+```
 
-This repository does **not** claim to reproduce COG's learned optimal-transport model.
+The current confidence score is a transparent heuristic, not a calibrated
+probability. No learned optimal-transport model is claimed or included.
 
-## Current status
+## Recording-quality gate
 
-- [x] RGB-D frame format and D435i capture script
-- [x] Pixel back-projection
-- [x] Mutual-nearest confidence filtering
-- [x] Confidence-weighted RANSAC and SE(3) refinement
-- [x] Deterministic synthetic validation with outliers
-- [x] OpenCV SIFT/ORB feature baseline
-- [x] DINOv2 patch feature backend
-- [ ] Self-collected D435i benchmark
-- [ ] Viewpoint and occlusion experiments
+Every recorded sequence can be screened before it enters an experiment. The
+gate never writes to the original session and returns a machine-readable
+`PASS`, `WARN`, or `REJECT` report.
 
-## Quick start
+```mermaid
+flowchart TD
+    S[Recorded session] --> A[metadata and frame counts]
+    A --> B[CSV pairing and file references]
+    B --> C[RGB/depth decode and resolution]
+    C --> D[depth scale, invalid values, timestamps]
+    D --> E[representative SIFT check]
+    E --> F{optional reference/query pair}
+    F -->|provided| G[ROI-aware 2D matching and 3D RANSAC]
+    F -->|omitted| H[recording-only report]
+    G --> I{gate decision}
+    H --> I
+    I --> P[PASS]
+    I --> W[WARN: review evidence]
+    I --> R[REJECT: keep out of benchmark]
+```
+
+## Verified status
+
+| Component | Status | Evidence level |
+|---|---|---|
+| Custom `rgb.png` / `depth_m.npy` / `intrinsics.txt` loader | Implemented | Existing unit tests |
+| D435i sequence adapter using `frames.csv` | Implemented | Unit tests and read-only real-session decoding |
+| RGB channel and raw `uint16` depth handling | Implemented | Synthetic-session tests; `0` and `65535` invalid |
+| Camera intrinsics and 2D-to-3D back-projection | Implemented | Unit tests and real-session pair diagnostics |
+| SIFT baseline and mutual-NN matching | Implemented | CPU execution on real frames |
+| Confidence-aware weighted Kabsch/RANSAC | Implemented | Deterministic synthetic validation |
+| Read-only recording-quality validator | Implemented | Unit tests and full real-session scan |
+| Rectangular reference/query feature ROI | Implemented | Unit tests and real SIFT sanity check |
+| DINOv2 backend | Code path only | Not installed or experimentally validated |
+| Ground-truth pose benchmark | Not available | Manual rotation is not ground truth |
+| Weighted-vs-unweighted experimental comparison | Not implemented | Deliberately out of scope for the current stage |
+
+The verified synthetic run reports:
+
+```text
+inliers=105/160
+weighted_rmse_m=0.003205
+rotation_error_deg=0.0839
+translation_error_m=0.001614
+```
+
+These are synthetic results with known generated motion and outliers. They are
+not real-world measurements.
+
+## Environment
+
+The development target is:
+
+- WSL2 Ubuntu 22.04 for CPU development and later GPU inference;
+- Python 3.10 in a project-local `.venv`;
+- Windows-side D435i capture with aligned color/depth;
+- offline sequence inspection from a mounted path such as `/mnt/e/...`.
+
+The CPU sequence adapter and SIFT baseline do not require direct D435i USB
+access from WSL. `pyrealsense2` is only needed by the acquisition script on a
+machine with the camera. PyTorch, Open3D, ROS, CUDA toolkits, and DINOv2 are
+not required for the current baseline.
+
+## Installation
 
 ```bash
-python -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e '.[vision,dev]'
+```
+
+Run the checks:
+
+```bash
+python -m pytest -q
 python scripts/synthetic_demo.py
+python -m pip check
 ```
 
-Expected synthetic output is a sub-degree rotation error and sub-centimeter translation error despite low-confidence outlier correspondences.
+## Data formats
 
-### Capture a D435i frame
+The original small pair pipeline remains compatible with frame directories:
+
+```text
+frame_directory/
+├── rgb.png
+├── depth_m.npy
+└── intrinsics.txt
+```
+
+The D435i recorder uses a read-only session directory:
+
+```text
+session/
+├── calibration.json
+├── color/*.png
+├── depth/*.png
+├── frames.csv
+├── imu.csv
+├── metadata.json
+└── validation_report.json
+```
+
+`frames.csv` is the authoritative RGB/depth pairing table. The adapter parses
+aligned color-camera intrinsics from `calibration.json`, converts raw `uint16`
+depth using the recorded scale, and maps raw `0` and `65535` to invalid metric
+depth `0.0`. It does not impose a hidden 3 m cutoff.
+
+Raw captures and mounted Windows paths are intentionally not part of this
+repository.
+
+## Usage
+
+### Inspect one recorded frame
 
 ```bash
-pip install -e '.[realsense]'
-python scripts/capture_realsense.py data/cup/view_000
-python scripts/capture_realsense.py data/cup/view_001
+python scripts/inspect_realsense_sequence.py \
+  /mnt/e/path/to/session \
+  --frame-index 30 \
+  --output results/frame_030
 ```
 
-Each frame directory contains `rgb.png`, `depth_m.npy`, and `intrinsics.txt`.
+The command writes an RGB preview, a normalized depth preview, and a JSON
+summary without modifying the session.
 
-### Estimate one RGB-D pair
+### Screen a recording
 
-Start with SIFT because it is quick to debug:
+Recording-only scan:
 
 ```bash
-pip install -e '.[vision]'
-python scripts/run_pair.py data/cup/view_000 data/cup/view_001 \
-  --backend sift --output results/cup_000_001_sift.json
+python scripts/validate_experiment_candidate.py \
+  /mnt/e/path/to/session \
+  --full-scan \
+  --output results/session_quality.json
 ```
 
-Then run pretrained DINOv2 features:
+Add a pair-level SIFT/3-D check when the intended reference and query frames
+are known:
 
 ```bash
-pip install -e '.[dino]'
-python scripts/run_pair.py data/cup/view_000 data/cup/view_001 \
-  --backend dino --min-similarity 0.6 \
-  --output results/cup_000_001_dino.json
+python scripts/validate_experiment_candidate.py \
+  /mnt/e/path/to/session \
+  --reference-index 60 \
+  --query-index 260 \
+  --backend sift \
+  --reference-roi 180 155 410 470 \
+  --query-roi 180 155 440 470 \
+  --output results/pair_quality.json
 ```
 
-## Planned evaluation
+The exit codes are `0=PASS`, `1=WARN`, and `2=REJECT`. A recording-level
+decision and a pair-level decision are reported separately. A pair can pass
+while the recording remains rejected because of an unrelated warm-up frame or
+recording-quality issue.
 
-Use 5 everyday objects with small, medium, and large viewpoint changes. Compare:
+### Estimate a pair
 
-| Variant | Appearance | Confidence | Geometry |
-|---|---|---|---|
-| SIFT baseline | SIFT | ratio test | RANSAC |
-| DINO baseline | DINOv2 | similarity threshold | RANSAC |
-| Proposed | DINOv2 | mutual NN + similarity + valid depth | weighted RANSAC |
+The existing positional frame-directory interface is preserved:
 
-Primary metrics: correspondence inlier ratio, RANSAC inlier count, 3D registration RMSE, rotation error, and translation error. ArUco-based ground truth is optional; results without ground truth must be labeled as registration metrics rather than pose accuracy.
+```bash
+python scripts/run_pair.py \
+  data/object/view_000 data/object/view_001 \
+  --backend sift \
+  --output results/pair.json
+```
 
-## Limitations
+The D435i sequence mode uses two indices from one session:
 
-The current confidence score is heuristic and is not a calibrated probability. Object masks, symmetries, low-texture surfaces, missing depth, and large viewpoint changes can still cause failure. The study tests a lightweight interpretation of confidence-aware matching, not the learned marginals or optimal transport used by COG.
+```bash
+python scripts/run_pair.py \
+  --session /mnt/e/path/to/session \
+  --reference-index 60 \
+  --query-index 260 \
+  --backend sift \
+  --reference-roi 180 155 410 470 \
+  --query-roi 180 155 440 470 \
+  --output results/pair.json \
+  --evidence-dir results/pair_evidence
+```
+
+ROI coordinates use `(x0, y0, x1, y1)` with exclusive upper bounds. They mask
+feature extraction while retaining full-image keypoint coordinates; they do
+not crop or alter the RGB-D data. Separate reference and query rectangles are
+supported because viewpoint changes move the object.
+
+## Real-data interpretation
+
+The inspected `anime_box_small_turn` recording contains an initial static
+front-facing box, a hand-driven rotation interval, and a final static rotated
+box. A clean diagnostic pair was selected from frames `60` and `260`:
+
+| Metric | Reference 60 | Query 260 |
+|---|---:|---:|
+| RGB-depth timestamp difference | 9.199 ms | 9.063 ms |
+| Full-frame usable depth ratio | 94.25% | 94.56% |
+| ROI SIFT features | 357 | 375 |
+| Visual matches | — | 77 |
+| Valid 3D matches | — | 74 |
+| RANSAC inliers | — | 65 |
+| Inlier ratio | — | 0.8784 |
+| Weighted RMSE | — | 0.002723 m |
+
+This is a static-camera diagnostic with manually observed object motion. The
+manual rotation is not an independently measured pose, so the transform is
+not reported as a pose error or ground-truth evaluation. The fixed curtain and
+table still produce some raw SIFT matches; an object mask or polygonal ROI is
+the next step before making benchmark claims.
+
+## Limitations and scope
+
+- The confidence score is heuristic and not calibrated.
+- Rectangular ROI is manual; automatic segmentation is not implemented.
+- No ground-truth object pose is currently recorded.
+- Static-camera sequences are useful for parsing and sanity checks, not for a
+  viewpoint-change benchmark by themselves.
+- Low-texture surfaces, occlusion, object symmetries, and missing depth can
+  still produce plausible but incorrect correspondences.
+- DINOv2, Open3D, ROS, Gazebo, Isaac Sim, and a large benchmark are deliberately
+  deferred.
+
+The intended next research step is a controlled viewpoint-change capture with
+known camera/object motion or an independent fiducial/robotic reference, while
+keeping the screening gate ahead of all experiment ingestion.

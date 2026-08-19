@@ -36,6 +36,20 @@ def main() -> int:
     parser.add_argument("--top-fraction", type=float, default=0.50)
     parser.add_argument("--ransac-threshold", type=float, default=0.03)
     parser.add_argument(
+        "--reference-roi",
+        nargs=4,
+        type=int,
+        metavar=("X0", "Y0", "X1", "Y1"),
+        help="restrict pair-check SIFT features to this reference rectangle",
+    )
+    parser.add_argument(
+        "--query-roi",
+        nargs=4,
+        type=int,
+        metavar=("X0", "Y0", "X1", "Y1"),
+        help="restrict pair-check SIFT features to this query rectangle",
+    )
+    parser.add_argument(
         "--full-scan",
         action="store_true",
         help="decode every RGB/depth pair; default checks all references and decodes samples",
@@ -58,6 +72,8 @@ def main() -> int:
         top_fraction=args.top_fraction,
         ransac_threshold_m=args.ransac_threshold,
         full_scan=args.full_scan,
+        reference_roi=args.reference_roi,
+        query_roi=args.query_roi,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
