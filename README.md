@@ -13,45 +13,24 @@ can be inspected before larger models or experiments are introduced.
 ## Pipeline
 
 ```mermaid
-flowchart LR
-    A[Windows D435i capture] --> B[Aligned RGB-D sequence]
-    B --> C[Read-only sequence adapter]
-    C --> D[RGB + depth + intrinsics]
-    D --> E[SIFT/ORB features]
-    E --> F[Mutual-NN matches]
-    F --> G[Appearance confidence]
-    D --> H[2D-to-3D back-projection]
-    G --> I[Confidence-aware 3D correspondences]
-    H --> I
-    I --> J[Weighted Kabsch + RANSAC]
-    J --> K[SE(3), inliers, RMSE]
+flowchart TD
+    A[Windows D435i capture] --> B[Read-only RGB-D adapter]
+    B --> C[RGB + depth + intrinsics]
+    C --> D[2D SIFT/ORB matches + confidence]
+    C --> E[Depth back-projection]
+    D --> F[Confidence-aware 3D correspondences]
+    E --> F
+    F --> G[Weighted Kabsch + RANSAC]
+    G --> H[SE(3), inliers, RMSE]
 ```
 
 The current confidence score is a transparent heuristic, not a calibrated
 probability. No learned optimal-transport model is claimed or included.
 
-## Recording-quality gate
-
-Every recorded sequence can be screened before it enters an experiment. The
-gate never writes to the original session and returns a machine-readable
-`PASS`, `WARN`, or `REJECT` report.
-
-```mermaid
-flowchart TD
-    S[Recorded session] --> A[metadata and frame counts]
-    A --> B[CSV pairing and file references]
-    B --> C[RGB/depth decode and resolution]
-    C --> D[depth scale, invalid values, timestamps]
-    D --> E[representative SIFT check]
-    E --> F{optional reference/query pair}
-    F -->|provided| G[ROI/mask-aware 2D matching and 3D RANSAC]
-    F -->|omitted| H[recording-only report]
-    G --> I{gate decision}
-    H --> I
-    I --> P[PASS]
-    I --> W[WARN: review evidence]
-    I --> R[REJECT: keep out of benchmark]
-```
+Recording inspection is a separate utility rather than another stage in the
+pose-estimation diagram. It produces a machine-readable eligibility report,
+and motion candidates still require visual review before a pair is approved.
+The scan never writes to the original session.
 
 ## Verified status
 
@@ -63,7 +42,7 @@ flowchart TD
 | Camera intrinsics and 2D-to-3D back-projection | Implemented | Unit tests and real-session pair diagnostics |
 | SIFT baseline and mutual-NN matching | Implemented | CPU execution on real frames |
 | Confidence-aware weighted Kabsch/RANSAC | Implemented | Deterministic synthetic validation |
-| Read-only recording-quality validator | Implemented | Unit tests and full real-session scan |
+| Read-only recording scan and eligibility report | Implemented | Unit tests and full real-session scan |
 | Rectangular reference/query feature ROI | Implemented | Unit tests and real SIFT sanity check |
 | Polygonal reference/query feature mask | Implemented | Unit tests and real-session SIFT run |
 | Read-only motion/stable-segment scan | Implemented | Deterministic tests and real-session scan |
@@ -213,9 +192,9 @@ python scripts/approve_motion_review.py \
   --note "visually checked; no hand visible in either selected frame"
 ```
 
-Pass the approved manifest to the pair runner or quality gate to enforce the
-decision. Omitting `--review-manifest` preserves the existing backward-
-compatible behavior.
+Pass the approved manifest to the pair runner or experiment validator to
+enforce the decision. Omitting `--review-manifest` preserves the existing
+backward-compatible behavior.
 
 ```bash
 python scripts/run_pair.py \
@@ -241,10 +220,10 @@ python scripts/validate_experiment_candidate.py \
   --output results/pair_quality.json
 ```
 
-The exit codes are `0=PASS`, `1=WARN`, and `2=REJECT`. A recording-level
-decision and a pair-level decision are reported separately. A pair can pass
-while the recording remains rejected because of an unrelated warm-up frame or
-recording-quality issue.
+The exit codes are `0=PASS`, `1=WARN`, and `2=REJECT`. A recording-level scan
+and a pair-level decision are reported separately. A pair can pass while the
+recording remains rejected because of an unrelated warm-up frame or scan
+issue.
 
 ### Estimate a pair
 
