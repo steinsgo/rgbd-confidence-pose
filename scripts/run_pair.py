@@ -14,14 +14,15 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from rgbd_pose.features import (
+    build_feature_mask,
     extract_dinov2_patch_features,
     extract_opencv_features,
-    rectangular_roi_mask,
 )
 from rgbd_pose.geometry import backproject_pixels, rotation_error_deg
 from rgbd_pose.io import load_rgbd_frame
 from rgbd_pose.matching import combine_confidence, mutual_nearest_matches
 from rgbd_pose.pose import estimate_pose_ransac
+from rgbd_pose.quality_review import validate_approved_pair
 from rgbd_pose.realsense_sequence import RealSenseFrame, load_realsense_sequence_frame
 
 
@@ -101,15 +102,28 @@ def _add_sequence_metadata(
         payload["query"] = _frame_payload(query_frame)
 
 
+def _add_review_metadata(
+    payload: dict[str, object], review_info: dict[str, object] | None
+) -> None:
+    if review_info is not None:
+        payload["review_manifest"] = review_info
+
+
 def _add_roi_metadata(
     payload: dict[str, object],
     reference_roi: list[int] | None,
     query_roi: list[int] | None,
+    reference_polygon: list[float] | None = None,
+    query_polygon: list[float] | None = None,
 ) -> None:
     if reference_roi is not None:
         payload["reference_roi_xyxy"] = reference_roi
     if query_roi is not None:
         payload["query_roi_xyxy"] = query_roi
+    if reference_polygon is not None:
+        payload["reference_polygon_xy"] = reference_polygon
+    if query_polygon is not None:
+        payload["query_polygon_xy"] = query_polygon
 
 
 def _save_evidence(
@@ -177,8 +191,27 @@ def main() -> None:
         metavar=("X0", "Y0", "X1", "Y1"),
         help="restrict OpenCV features to this query image rectangle",
     )
+    parser.add_argument(
+        "--reference-polygon",
+        nargs="+",
+        type=float,
+        metavar="COORD",
+        help="restrict OpenCV features to reference polygon x0 y0 x1 y1 ...",
+    )
+    parser.add_argument(
+        "--query-polygon",
+        nargs="+",
+        type=float,
+        metavar="COORD",
+        help="restrict OpenCV features to query polygon x0 y0 x1 y1 ...",
+    )
     parser.add_argument("--output", type=Path, default=Path("results/pair.json"))
     parser.add_argument("--evidence-dir", type=Path)
+    parser.add_argument(
+        "--review-manifest",
+        type=Path,
+        help="require this manifest to explicitly approve the session pair",
+    )
     args = parser.parse_args()
 
     if args.session is not None:
@@ -186,6 +219,18 @@ def main() -> None:
             parser.error("--session cannot be combined with positional frame directories")
         if args.reference_index is None or args.query_index is None:
             parser.error("--session requires --reference-index and --query-index")
+        try:
+            review_info = (
+                validate_approved_pair(
+                    args.review_manifest,
+                    args.reference_index,
+                    args.query_index,
+                )
+                if args.review_manifest is not None
+                else None
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
         reference_frame = load_realsense_sequence_frame(args.session, args.reference_index)
         query_frame = load_realsense_sequence_frame(args.session, args.query_index)
         ref_rgb, ref_depth, ref_k = (
@@ -203,17 +248,36 @@ def main() -> None:
             parser.error("provide two frame directories or --session with two frame indices")
         if args.reference_index is not None or args.query_index is not None:
             parser.error("frame indices require --session")
+        if args.review_manifest is not None:
+            parser.error("--review-manifest requires --session")
+        review_info = None
         reference_frame = None
         query_frame = None
         ref_rgb, ref_depth, ref_k = load_rgbd_frame(args.reference)
         query_rgb, query_depth, query_k = load_rgbd_frame(args.query)
 
     if args.backend == "dino" and (
-        args.reference_roi is not None or args.query_roi is not None
+        args.reference_roi is not None
+        or args.query_roi is not None
+        or args.reference_polygon is not None
+        or args.query_polygon is not None
     ):
-        parser.error("--reference-roi/--query-roi are supported only for SIFT or ORB")
-    reference_roi_mask = rectangular_roi_mask(ref_rgb.shape, args.reference_roi)
-    query_roi_mask = rectangular_roi_mask(query_rgb.shape, args.query_roi)
+        parser.error(
+            "ROI and polygon masks are supported only for SIFT or ORB"
+        )
+    try:
+        reference_roi_mask = build_feature_mask(
+            ref_rgb.shape,
+            roi_xyxy=args.reference_roi,
+            polygon_xy=args.reference_polygon,
+        )
+        query_roi_mask = build_feature_mask(
+            query_rgb.shape,
+            roi_xyxy=args.query_roi,
+            polygon_xy=args.query_polygon,
+        )
+    except (RuntimeError, ValueError) as exc:
+        parser.error(str(exc))
 
     started = time.perf_counter()
     if args.backend == "dino":
@@ -258,7 +322,14 @@ def main() -> None:
             "runtime_s": time.perf_counter() - started,
         }
         _add_sequence_metadata(failure_payload, args.session, reference_frame, query_frame)
-        _add_roi_metadata(failure_payload, args.reference_roi, args.query_roi)
+        _add_review_metadata(failure_payload, review_info)
+        _add_roi_metadata(
+            failure_payload,
+            args.reference_roi,
+            args.query_roi,
+            args.reference_polygon,
+            args.query_polygon,
+        )
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(
             json.dumps(failure_payload, indent=2) + "\n", encoding="utf-8"
@@ -307,7 +378,14 @@ def main() -> None:
         "transform_reference_to_query": estimate.transform.tolist(),
     }
     _add_sequence_metadata(payload, args.session, reference_frame, query_frame)
-    _add_roi_metadata(payload, args.reference_roi, args.query_roi)
+    _add_review_metadata(payload, review_info)
+    _add_roi_metadata(
+        payload,
+        args.reference_roi,
+        args.query_roi,
+        args.reference_polygon,
+        args.query_polygon,
+    )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

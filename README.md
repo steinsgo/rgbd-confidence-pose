@@ -44,7 +44,7 @@ flowchart TD
     C --> D[depth scale, invalid values, timestamps]
     D --> E[representative SIFT check]
     E --> F{optional reference/query pair}
-    F -->|provided| G[ROI-aware 2D matching and 3D RANSAC]
+    F -->|provided| G[ROI/mask-aware 2D matching and 3D RANSAC]
     F -->|omitted| H[recording-only report]
     G --> I{gate decision}
     H --> I
@@ -65,6 +65,10 @@ flowchart TD
 | Confidence-aware weighted Kabsch/RANSAC | Implemented | Deterministic synthetic validation |
 | Read-only recording-quality validator | Implemented | Unit tests and full real-session scan |
 | Rectangular reference/query feature ROI | Implemented | Unit tests and real SIFT sanity check |
+| Polygonal reference/query feature mask | Implemented | Unit tests and real-session SIFT run |
+| Read-only motion/stable-segment scan | Implemented | Deterministic tests and real-session scan |
+| Candidate RGB/depth review package | Implemented | Real-session contact sheets and manifest |
+| Explicit reviewed-pair approval gate | Implemented | Unit tests and pending/approved CLI checks |
 | DINOv2 backend | Code path only | Not installed or experimentally validated |
 | Ground-truth pose benchmark | Not available | Manual rotation is not ground truth |
 | Weighted-vs-unweighted experimental comparison | Not implemented | Deliberately out of scope for the current stage |
@@ -167,6 +171,62 @@ python scripts/validate_experiment_candidate.py \
   --output results/session_quality.json
 ```
 
+To help select static reference/query frames after recording, add the motion
+scan. It implies a full RGB-D decode and reports candidate change intervals and
+stable frame segments. A broad target ROI makes small object/hand motion more
+visible than a whole-image score:
+
+```bash
+python scripts/validate_experiment_candidate.py \
+  /mnt/e/path/to/session \
+  --motion-scan \
+  --motion-roi 160 80 480 400 \
+  --output results/session_motion_quality.json
+```
+
+The motion score is a low-resolution RGB difference heuristic. It identifies
+candidate changes but does not determine whether the cause was a hand, object,
+lighting, or camera motion. It is a frame-selection aid, not pose ground truth.
+Reported stable segments mean only low temporal RGB change; a hand that remains
+still can still be present, so candidate segments require visual review. When
+triggers are found, the JSON report sets `manual_review_required: true`.
+
+Export a small visual review package without rescanning the session:
+
+```bash
+python scripts/export_motion_review.py \
+  /mnt/e/path/to/session \
+  --quality-report results/session_motion_quality.json \
+  --output results/session_motion_review
+```
+
+The output contains RGB/depth contact sheets, individual candidate-frame
+previews, and `review_manifest.json` with `PENDING_MANUAL_REVIEW` status.
+
+After visually confirming a pair, approve it explicitly:
+
+```bash
+python scripts/approve_motion_review.py \
+  results/session_motion_review/review_manifest.json \
+  --reference-index 80 \
+  --query-index 500 \
+  --note "visually checked; no hand visible in either selected frame"
+```
+
+Pass the approved manifest to the pair runner or quality gate to enforce the
+decision. Omitting `--review-manifest` preserves the existing backward-
+compatible behavior.
+
+```bash
+python scripts/run_pair.py \
+  --session /mnt/e/path/to/session \
+  --reference-index 80 \
+  --query-index 500 \
+  --backend sift \
+  --review-manifest results/session_motion_review/review_manifest.json \
+  --output results/approved_pair.json
+```
+
 Add a pair-level SIFT/3-D check when the intended reference and query frames
 are known:
 
@@ -216,6 +276,24 @@ feature extraction while retaining full-image keypoint coordinates; they do
 not crop or alter the RGB-D data. Separate reference and query rectangles are
 supported because viewpoint changes move the object.
 
+For a tighter manual object mask, pass polygon vertices as a flat sequence of
+`x y` values. The reference and query polygons may differ because the visible
+object silhouette can change:
+
+```bash
+python scripts/run_pair.py \
+  --session /mnt/e/path/to/session \
+  --reference-index 80 \
+  --query-index 500 \
+  --backend sift \
+  --reference-polygon 258 129 369 119 391 298 273 327 258 303 \
+  --query-polygon 300 117 408 150 415 323 331 341 210 249 254 166 \
+  --output results/pair_polygon.json
+```
+
+The polygon intersects a supplied rectangle when both are present. It masks
+feature extraction only; the original RGB-D files remain untouched.
+
 ## Real-data interpretation
 
 The inspected `anime_box_small_turn` recording contains an initial static
@@ -236,13 +314,15 @@ box. A clean diagnostic pair was selected from frames `60` and `260`:
 This is a static-camera diagnostic with manually observed object motion. The
 manual rotation is not an independently measured pose, so the transform is
 not reported as a pose error or ground-truth evaluation. The fixed curtain and
-table still produce some raw SIFT matches; an object mask or polygonal ROI is
-the next step before making benchmark claims.
+table can still produce raw SIFT matches, so a manually specified polygon mask
+is useful for diagnostics, but it is not automatic segmentation or benchmark
+ground truth.
 
 ## Limitations and scope
 
 - The confidence score is heuristic and not calibrated.
-- Rectangular ROI is manual; automatic segmentation is not implemented.
+- Rectangular ROIs and polygon masks are manual; automatic segmentation is not
+  implemented.
 - No ground-truth object pose is currently recorded.
 - Static-camera sequences are useful for parsing and sanity checks, not for a
   viewpoint-change benchmark by themselves.
