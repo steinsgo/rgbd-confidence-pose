@@ -13,11 +13,25 @@ import numpy as np
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from rgbd_pose.features import extract_dinov2_patch_features, extract_opencv_features
+from rgbd_pose.features import (
+    build_feature_mask,
+    extract_dinov2_patch_features,
+    extract_opencv_features,
+    intersect_feature_masks,
+    load_feature_mask,
+    load_dinov2_model,
+)
+from rgbd_pose.dino_quality import summarize_dino_quality
 from rgbd_pose.geometry import backproject_pixels, rotation_error_deg
 from rgbd_pose.io import load_rgbd_frame
 from rgbd_pose.matching import combine_confidence, mutual_nearest_matches
-from rgbd_pose.pose import estimate_pose_ransac
+from rgbd_pose.pose import (
+    PoseEstimate,
+    estimate_pose_comparison,
+    estimate_pose_ransac,
+    summarize_pose_estimate,
+)
+from rgbd_pose.quality_review import validate_approved_pair
 from rgbd_pose.realsense_sequence import RealSenseFrame, load_realsense_sequence_frame
 
 
@@ -97,6 +111,104 @@ def _add_sequence_metadata(
         payload["query"] = _frame_payload(query_frame)
 
 
+def _add_review_metadata(
+    payload: dict[str, object], review_info: dict[str, object] | None
+) -> None:
+    if review_info is not None:
+        payload["review_manifest"] = review_info
+
+
+def _add_roi_metadata(
+    payload: dict[str, object],
+    reference_roi: list[int] | None,
+    query_roi: list[int] | None,
+    reference_polygon: list[float] | None = None,
+    query_polygon: list[float] | None = None,
+    reference_mask_path: Path | None = None,
+    query_mask_path: Path | None = None,
+) -> None:
+    if reference_roi is not None:
+        payload["reference_roi_xyxy"] = reference_roi
+    if query_roi is not None:
+        payload["query_roi_xyxy"] = query_roi
+    if reference_polygon is not None:
+        payload["reference_polygon_xy"] = reference_polygon
+    if query_polygon is not None:
+        payload["query_polygon_xy"] = query_polygon
+    if reference_mask_path is not None:
+        payload["reference_mask_path"] = str(reference_mask_path.resolve())
+    if query_mask_path is not None:
+        payload["query_mask_path"] = str(query_mask_path.resolve())
+
+
+def _comparison_metrics(
+    estimate: PoseEstimate,
+    weights: np.ndarray | None,
+    weighting: str,
+) -> dict[str, object]:
+    metrics = summarize_pose_estimate(estimate, weights)
+    metrics["weighting"] = weighting
+    metrics["rotation_deviation_from_identity_deg"] = rotation_error_deg(
+        estimate.transform[:3, :3], np.eye(3)
+    )
+    metrics["translation_deviation_from_identity_m"] = float(
+        np.linalg.norm(estimate.transform[:3, 3])
+    )
+    return metrics
+
+
+def _add_dino_quality_metadata(
+    payload: dict[str, object],
+    args: argparse.Namespace,
+    reference_features,
+    query_features,
+    reference_mask: np.ndarray | None,
+    query_mask: np.ndarray | None,
+) -> None:
+    if args.backend != "dino":
+        return
+
+    def optional_int(name: str) -> int | None:
+        value = payload.get(name)
+        return int(value) if value is not None else None
+
+    def optional_float(name: str) -> float | None:
+        value = payload.get(name)
+        return float(value) if value is not None else None
+
+    payload["dino_quality"] = summarize_dino_quality(
+        reference_features=reference_features,
+        query_features=query_features,
+        reference_mask=reference_mask,
+        query_mask=query_mask,
+        reference_roi=args.reference_roi,
+        query_roi=args.query_roi,
+        reference_polygon=args.reference_polygon,
+        query_polygon=args.query_polygon,
+        reference_mask_path=(
+            str(args.reference_mask.resolve())
+            if args.reference_mask is not None
+            else None
+        ),
+        query_mask_path=(
+            str(args.query_mask.resolve()) if args.query_mask is not None else None
+        ),
+        depth_valid_matches=int(payload.get("depth_valid_matches", 0)),
+        valid_3d_matches=int(payload.get("valid_3d_matches", 0)),
+        not_used_3d_matches=int(payload.get("not_used_3d_matches", 0)),
+        inliers=optional_int("inliers"),
+        inlier_ratio=optional_float("inlier_ratio"),
+        weighted_rmse_m=optional_float("weighted_rmse_m"),
+        ransac_threshold_m=optional_float("ransac_threshold_m"),
+        rotation_deviation_from_identity_deg=optional_float(
+            "rotation_deviation_from_identity_deg"
+        ),
+        translation_deviation_from_identity_m=optional_float(
+            "translation_deviation_from_identity_m"
+        ),
+    )
+
+
 def _save_evidence(
     evidence_dir: Path,
     reference_rgb: np.ndarray,
@@ -145,18 +257,86 @@ def main() -> None:
     parser.add_argument("--reference-index", type=int)
     parser.add_argument("--query-index", type=int)
     parser.add_argument("--backend", choices=["sift", "orb", "dino"], default="sift")
+    parser.add_argument("--dino-model", default="dinov2_vits14")
+    parser.add_argument("--dino-device", choices=["cuda", "cpu"], default="cuda")
+    parser.add_argument("--dino-max-side", type=int, default=560)
     parser.add_argument("--min-similarity", type=float, default=0.55)
     parser.add_argument("--top-fraction", type=float, default=0.5)
     parser.add_argument("--ransac-threshold", type=float, default=0.03)
+    parser.add_argument("--ransac-iterations", type=int, default=1500)
+    parser.add_argument("--ransac-seed", type=int, default=0)
+    parser.add_argument(
+        "--compare-unweighted",
+        action="store_true",
+        help="also estimate a uniform baseline from the same valid 3-D matches",
+    )
+    parser.add_argument(
+        "--reference-roi",
+        nargs=4,
+        type=int,
+        metavar=("X0", "Y0", "X1", "Y1"),
+        help="restrict OpenCV features to this reference image rectangle",
+    )
+    parser.add_argument(
+        "--query-roi",
+        nargs=4,
+        type=int,
+        metavar=("X0", "Y0", "X1", "Y1"),
+        help="restrict OpenCV features to this query image rectangle",
+    )
+    parser.add_argument(
+        "--reference-polygon",
+        nargs="+",
+        type=float,
+        metavar="COORD",
+        help="restrict OpenCV features to reference polygon x0 y0 x1 y1 ...",
+    )
+    parser.add_argument(
+        "--query-polygon",
+        nargs="+",
+        type=float,
+        metavar="COORD",
+        help="restrict OpenCV features to query polygon x0 y0 x1 y1 ...",
+    )
+    parser.add_argument(
+        "--reference-mask",
+        type=Path,
+        help="load a reference binary/grayscale feature mask image",
+    )
+    parser.add_argument(
+        "--query-mask",
+        type=Path,
+        help="load a query binary/grayscale feature mask image",
+    )
     parser.add_argument("--output", type=Path, default=Path("results/pair.json"))
     parser.add_argument("--evidence-dir", type=Path)
+    parser.add_argument(
+        "--review-manifest",
+        type=Path,
+        help="require this manifest to explicitly approve the session pair",
+    )
     args = parser.parse_args()
+
+    if args.ransac_iterations < 1:
+        parser.error("--ransac-iterations must be positive")
 
     if args.session is not None:
         if args.reference is not None or args.query is not None:
             parser.error("--session cannot be combined with positional frame directories")
         if args.reference_index is None or args.query_index is None:
             parser.error("--session requires --reference-index and --query-index")
+        try:
+            review_info = (
+                validate_approved_pair(
+                    args.review_manifest,
+                    args.reference_index,
+                    args.query_index,
+                )
+                if args.review_manifest is not None
+                else None
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
         reference_frame = load_realsense_sequence_frame(args.session, args.reference_index)
         query_frame = load_realsense_sequence_frame(args.session, args.query_index)
         ref_rgb, ref_depth, ref_k = (
@@ -174,18 +354,80 @@ def main() -> None:
             parser.error("provide two frame directories or --session with two frame indices")
         if args.reference_index is not None or args.query_index is not None:
             parser.error("frame indices require --session")
+        if args.review_manifest is not None:
+            parser.error("--review-manifest requires --session")
+        review_info = None
         reference_frame = None
         query_frame = None
         ref_rgb, ref_depth, ref_k = load_rgbd_frame(args.reference)
         query_rgb, query_depth, query_k = load_rgbd_frame(args.query)
 
+    try:
+        reference_roi_mask = build_feature_mask(
+            ref_rgb.shape,
+            roi_xyxy=args.reference_roi,
+            polygon_xy=args.reference_polygon,
+        )
+        query_roi_mask = build_feature_mask(
+            query_rgb.shape,
+            roi_xyxy=args.query_roi,
+            polygon_xy=args.query_polygon,
+        )
+        reference_file_mask = (
+            load_feature_mask(args.reference_mask, ref_rgb.shape)
+            if args.reference_mask is not None
+            else None
+        )
+        query_file_mask = (
+            load_feature_mask(args.query_mask, query_rgb.shape)
+            if args.query_mask is not None
+            else None
+        )
+        reference_roi_mask = intersect_feature_masks(
+            reference_roi_mask, reference_file_mask
+        )
+        query_roi_mask = intersect_feature_masks(query_roi_mask, query_file_mask)
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        parser.error(str(exc))
+
     started = time.perf_counter()
+    dino_runtime: dict[str, object] | None = None
     if args.backend == "dino":
-        ref_features = extract_dinov2_patch_features(ref_rgb)
-        query_features = extract_dinov2_patch_features(query_rgb)
+        try:
+            dino_model, actual_dino_device = load_dinov2_model(
+                args.dino_model, args.dino_device
+            )
+            ref_features = extract_dinov2_patch_features(
+                ref_rgb,
+                args.dino_model,
+                actual_dino_device,
+                args.dino_max_side,
+                model=dino_model,
+                mask=reference_roi_mask,
+            )
+            query_features = extract_dinov2_patch_features(
+                query_rgb,
+                args.dino_model,
+                actual_dino_device,
+                args.dino_max_side,
+                model=dino_model,
+                mask=query_roi_mask,
+            )
+        except (RuntimeError, ValueError) as exc:
+            parser.error(str(exc))
+        dino_runtime = {
+            "model": args.dino_model,
+            "device": actual_dino_device,
+            "max_side": args.dino_max_side,
+            "model_loaded_once_per_pair": True,
+        }
     else:
-        ref_features = extract_opencv_features(ref_rgb, args.backend)
-        query_features = extract_opencv_features(query_rgb, args.backend)
+        ref_features = extract_opencv_features(
+            ref_rgb, args.backend, mask=reference_roi_mask
+        )
+        query_features = extract_opencv_features(
+            query_rgb, args.backend, mask=query_roi_mask
+        )
     if len(ref_features.uv) < 3 or len(query_features.uv) < 3:
         raise SystemExit("Not enough visual features; use a textured object or a wider crop")
 
@@ -215,9 +457,36 @@ def main() -> None:
             "valid_3d_matches": int(valid.sum()),
             "not_used_3d_matches": int((~valid).sum()),
             "ransac_threshold_m": args.ransac_threshold,
+            "ransac_iterations": args.ransac_iterations,
+            "ransac_seed": args.ransac_seed,
             "runtime_s": time.perf_counter() - started,
         }
+        if dino_runtime is not None:
+            failure_payload["feature_extractor"] = dino_runtime
+        if args.compare_unweighted:
+            failure_payload["comparison"] = {
+                "status": "NOT_RUN",
+                "reason": failure_reason,
+            }
         _add_sequence_metadata(failure_payload, args.session, reference_frame, query_frame)
+        _add_review_metadata(failure_payload, review_info)
+        _add_roi_metadata(
+            failure_payload,
+            args.reference_roi,
+            args.query_roi,
+            args.reference_polygon,
+            args.query_polygon,
+            args.reference_mask,
+            args.query_mask,
+        )
+        _add_dino_quality_metadata(
+            failure_payload,
+            args,
+            ref_features,
+            query_features,
+            reference_roi_mask,
+            query_roi_mask,
+        )
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(
             json.dumps(failure_payload, indent=2) + "\n", encoding="utf-8"
@@ -237,12 +506,25 @@ def main() -> None:
             )
         print(json.dumps(failure_payload, indent=2))
         raise SystemExit(failure_reason)
-    estimate = estimate_pose_ransac(
-        ref_xyz[valid],
-        query_xyz[valid],
-        confidence[valid],
-        threshold_m=args.ransac_threshold,
-    )
+    if args.compare_unweighted:
+        estimate, unweighted_estimate = estimate_pose_comparison(
+            ref_xyz[valid],
+            query_xyz[valid],
+            confidence[valid],
+            threshold_m=args.ransac_threshold,
+            iterations=args.ransac_iterations,
+            seed=args.ransac_seed,
+        )
+    else:
+        estimate = estimate_pose_ransac(
+            ref_xyz[valid],
+            query_xyz[valid],
+            confidence[valid],
+            threshold_m=args.ransac_threshold,
+            iterations=args.ransac_iterations,
+            seed=args.ransac_seed,
+        )
+        unweighted_estimate = None
     runtime_s = time.perf_counter() - started
     payload: dict[str, object] = {
         "backend": args.backend,
@@ -256,6 +538,8 @@ def main() -> None:
         "inlier_ratio": float(estimate.inliers.mean()),
         "weighted_rmse_m": estimate.weighted_rmse_m,
         "ransac_threshold_m": args.ransac_threshold,
+        "ransac_iterations": args.ransac_iterations,
+        "ransac_seed": args.ransac_seed,
         "rotation_deviation_from_identity_deg": rotation_error_deg(
             estimate.transform[:3, :3], np.eye(3)
         ),
@@ -265,7 +549,42 @@ def main() -> None:
         "runtime_s": runtime_s,
         "transform_reference_to_query": estimate.transform.tolist(),
     }
+    if dino_runtime is not None:
+        payload["feature_extractor"] = dino_runtime
+    if unweighted_estimate is not None:
+        payload["comparison"] = {
+            "status": "PASS",
+            "same_valid_3d_correspondences": True,
+            "correspondence_count": int(valid.sum()),
+            "ransac_threshold_m": args.ransac_threshold,
+            "ransac_iterations": args.ransac_iterations,
+            "ransac_seed": args.ransac_seed,
+            "weighted": _comparison_metrics(
+                estimate, confidence[valid], "confidence"
+            ),
+            "unweighted": _comparison_metrics(
+                unweighted_estimate, None, "uniform"
+            ),
+        }
     _add_sequence_metadata(payload, args.session, reference_frame, query_frame)
+    _add_review_metadata(payload, review_info)
+    _add_roi_metadata(
+        payload,
+        args.reference_roi,
+        args.query_roi,
+        args.reference_polygon,
+        args.query_polygon,
+        args.reference_mask,
+        args.query_mask,
+    )
+    _add_dino_quality_metadata(
+        payload,
+        args,
+        ref_features,
+        query_features,
+        reference_roi_mask,
+        query_roi_mask,
+    )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

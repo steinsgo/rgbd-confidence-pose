@@ -12,14 +12,17 @@ import csv
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 import numpy as np
+from PIL import Image
 
-from .features import extract_opencv_features
+from .features import build_feature_mask, extract_opencv_features, rectangular_roi_mask
 from .geometry import backproject_pixels
 from .matching import combine_confidence, mutual_nearest_matches
+from .plane_mask import fit_plane_from_pixels, tabletop_foreground_mask
 from .pose import estimate_pose_ransac
+from .quality_review import validate_approved_pair
 from .realsense_sequence import RealSenseFrame, load_realsense_sequence_frame
 
 
@@ -42,6 +45,9 @@ class QualityThresholds:
     min_valid_3d_matches: int = 6
     min_ransac_inliers: int = 6
     min_inlier_ratio: float = 0.50
+    tabletop_plane_residual_warn_m: float = 0.010
+    tabletop_plane_residual_reject_m: float = 0.030
+    tabletop_mask_ratio_warn_max: float = 0.30
 
 
 def _issue(
@@ -175,11 +181,420 @@ def _depth_summary(frame: RealSenseFrame, thresholds: QualityThresholds) -> dict
     return summary
 
 
+def _motion_gray_signature(
+    frame: RealSenseFrame,
+    motion_roi: Sequence[int] | None,
+    output_size: tuple[int, int] = (64, 48),
+) -> np.ndarray:
+    """Return a normalized low-resolution grayscale signature for one frame."""
+    if motion_roi is None:
+        region = frame.rgb
+    else:
+        rectangular_roi_mask(frame.rgb.shape, motion_roi)
+        x0, y0, x1, y1 = (int(value) for value in motion_roi)
+        region = frame.rgb[y0:y1, x0:x1]
+    image = Image.fromarray(np.asarray(region, dtype=np.uint8), mode="RGB")
+    resized = image.convert("L").resize(output_size, Image.Resampling.BILINEAR)
+    return np.asarray(resized, dtype=np.float32) / 255.0
+
+
+def _contiguous_ranges(indices: Sequence[int]) -> list[dict[str, int]]:
+    """Summarize sorted frame indices as inclusive contiguous ranges."""
+    if not indices:
+        return []
+    values = sorted(set(int(index) for index in indices))
+    ranges: list[dict[str, int]] = []
+    start = previous = values[0]
+    for value in values[1:]:
+        if value != previous + 1:
+            ranges.append(
+                {
+                    "start_index": start,
+                    "end_index": previous,
+                    "frame_count": previous - start + 1,
+                }
+            )
+            start = value
+        previous = value
+    ranges.append(
+        {
+            "start_index": start,
+            "end_index": previous,
+            "frame_count": previous - start + 1,
+        }
+    )
+    return ranges
+
+
+def _motion_profile(
+    frames: Sequence[RealSenseFrame],
+    *,
+    motion_roi: Sequence[int] | None = None,
+    comparison_window: int = 5,
+    motion_quantile: float = 0.95,
+    minimum_score: float = 0.01,
+    minimum_stable_frames: int = 15,
+) -> dict[str, Any]:
+    """Describe candidate motion and stable frame segments without labeling causes.
+
+    Each score compares a frame with the frame ``comparison_window`` samples
+    earlier.  The threshold is the larger of a recording-relative quantile and
+    an explicit minimum score, so normal sensor/compression noise is not
+    automatically called motion.  This is a screening heuristic, not optical
+    flow or hand/object segmentation.
+    """
+    if comparison_window < 1:
+        raise ValueError("comparison_window must be positive")
+    if not 0.0 < motion_quantile < 1.0:
+        raise ValueError("motion_quantile must be between 0 and 1")
+    if not np.isfinite(minimum_score) or minimum_score < 0.0:
+        raise ValueError("minimum_score must be finite and non-negative")
+    if minimum_stable_frames < 1:
+        raise ValueError("minimum_stable_frames must be positive")
+    ordered = sorted(frames, key=lambda item: item.frame_index)
+    if len(ordered) <= comparison_window:
+        raise ValueError(
+            "motion scan requires more frames than comparison_window"
+        )
+    signatures = [
+        _motion_gray_signature(frame, motion_roi) for frame in ordered
+    ]
+    available_indices = {int(frame.frame_index) for frame in ordered}
+    scores: list[dict[str, Any]] = []
+    values: list[float] = []
+    for position in range(comparison_window, len(ordered)):
+        score = float(
+            np.mean(
+                np.abs(signatures[position] - signatures[position - comparison_window])
+            )
+        )
+        values.append(score)
+        scores.append(
+            {
+                "frame_index": int(ordered[position].frame_index),
+                "reference_frame_index": int(
+                    ordered[position - comparison_window].frame_index
+                ),
+                "mean_abs_gray_change": score,
+            }
+        )
+
+    score_array = np.asarray(values, dtype=np.float64)
+    quantile_score = float(np.quantile(score_array, motion_quantile))
+    threshold = max(quantile_score, float(minimum_score))
+    trigger_indices = [
+        int(item["frame_index"])
+        for item in scores
+        if float(item["mean_abs_gray_change"]) >= threshold
+    ]
+    trigger_set = set(trigger_indices)
+
+    # A windowed difference implicates the frames covered by that comparison,
+    # not only its final frame. Expand each trigger backward conservatively.
+    affected_indices: set[int] = set()
+    for item in scores:
+        if int(item["frame_index"]) not in trigger_set:
+            continue
+        current = int(item["frame_index"])
+        reference = int(item["reference_frame_index"])
+        affected_indices.update(
+            index
+            for index in range(reference + 1, current + 1)
+            if index in available_indices
+        )
+
+    all_indices = [int(frame.frame_index) for frame in ordered]
+    stable_indices = [index for index in all_indices if index not in affected_indices]
+    stable_ranges = [
+        item
+        for item in _contiguous_ranges(stable_indices)
+        if item["frame_count"] >= minimum_stable_frames
+    ]
+    candidate_ranges = _contiguous_ranges(sorted(affected_indices))
+    for item in candidate_ranges:
+        item["trigger_count"] = sum(
+            index in trigger_set
+            for index in range(item["start_index"], item["end_index"] + 1)
+        )
+
+    return {
+        "comparison_window_frames": comparison_window,
+        "motion_quantile": motion_quantile,
+        "quantile_score": quantile_score,
+        "minimum_score": float(minimum_score),
+        "threshold_score": threshold,
+        "signature_size": [64, 48],
+        "motion_roi_xyxy": (
+            [int(value) for value in motion_roi]
+            if motion_roi is not None
+            else None
+        ),
+        "score_min": float(score_array.min()),
+        "score_median": float(np.median(score_array)),
+        "score_max": float(score_array.max()),
+        "frame_scores": scores,
+        "motion_trigger_frame_indices": trigger_indices,
+        "motion_candidate_intervals": candidate_ranges,
+        "stable_segments": stable_ranges,
+        "stable_segment_interpretation": (
+            "low temporal RGB change only; not a hand-free or object-static guarantee"
+        ),
+        "manual_review_required": bool(trigger_indices),
+        "stable_segment_count": len(stable_ranges),
+        "longest_stable_segment_frames": max(
+            (item["frame_count"] for item in stable_ranges), default=0
+        ),
+    }
+
+
 def _frame_error_summary(index: int, exc: Exception) -> dict[str, Any]:
     return {
         "frame_index": index,
         "error_type": type(exc).__name__,
         "error": str(exc),
+    }
+
+
+def _normalize_tabletop_plane_points(
+    points_uv: Sequence[Sequence[float]] | Sequence[float] | np.ndarray,
+) -> np.ndarray:
+    try:
+        points = np.asarray(points_uv, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("tabletop plane points must be numeric") from exc
+    if points.ndim == 1:
+        if points.size < 6 or points.size % 2:
+            raise ValueError(
+                "tabletop plane points require at least three x,y pairs"
+            )
+        points = points.reshape(-1, 2)
+    elif points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError(
+            "tabletop plane points must have shape (N, 2) or be a flat x,y sequence"
+        )
+    if len(points) < 3:
+        raise ValueError("tabletop plane points require at least three samples")
+    if not np.isfinite(points).all():
+        raise ValueError("tabletop plane points must be finite")
+    return points
+
+
+def _mask_component_summary(mask: np.ndarray) -> dict[str, Any]:
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError(
+            "OpenCV is required for tabletop mask connected-component screening"
+        ) from exc
+    mask_array = np.asarray(mask, dtype=bool)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask_array.astype(np.uint8), connectivity=8
+    )
+    if count <= 1:
+        return {
+            "component_count": 0,
+            "largest_component_area": 0,
+            "largest_component_ratio": 0.0,
+            "largest_component_bbox_xyxy": None,
+            "component_areas_descending": [],
+        }
+    areas = stats[1:, cv2.CC_STAT_AREA].astype(np.int64)
+    order = np.argsort(areas)[::-1]
+    largest_index = int(order[0]) + 1
+    largest_area = int(areas[order[0]])
+    total_area = int(areas.sum())
+    x = int(stats[largest_index, cv2.CC_STAT_LEFT])
+    y = int(stats[largest_index, cv2.CC_STAT_TOP])
+    width = int(stats[largest_index, cv2.CC_STAT_WIDTH])
+    height = int(stats[largest_index, cv2.CC_STAT_HEIGHT])
+    return {
+        "component_count": int(len(areas)),
+        "largest_component_area": largest_area,
+        "largest_component_ratio": (
+            float(largest_area / total_area) if total_area else 0.0
+        ),
+        "largest_component_bbox_xyxy": [x, y, x + width, y + height],
+        "component_areas_descending": [int(areas[index]) for index in order[:5]],
+    }
+
+
+def _tabletop_mask_scan(
+    frame_cache: dict[int, RealSenseFrame],
+    frame_indices: Sequence[int],
+    plane_points_uv: Sequence[Sequence[float]] | Sequence[float] | np.ndarray,
+    *,
+    mask_roi: Sequence[int] | None,
+    min_height_m: float,
+    min_component_area: int,
+    close_kernel: int,
+    thresholds: QualityThresholds,
+    issues: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Screen a small set of frames with a read-only tabletop foreground mask."""
+
+    scan_issues: list[dict[str, Any]] = []
+
+    def add_issue(
+        severity: Literal["WARN", "REJECT"],
+        code: str,
+        message: str,
+        **details: Any,
+    ) -> None:
+        _issue(scan_issues, severity, code, message, "recording", **details)
+        _issue(issues, severity, code, message, "recording", **details)
+
+    try:
+        plane_points = _normalize_tabletop_plane_points(plane_points_uv)
+    except ValueError as exc:
+        add_issue("REJECT", "tabletop_plane_points_invalid", str(exc))
+        return {
+            "enabled": True,
+            "status": "REJECT",
+            "frame_indices": [int(index) for index in frame_indices],
+            "plane_reference_pixels_uv": None,
+            "frames": [],
+            "issues": scan_issues,
+        }
+
+    if not frame_indices:
+        add_issue(
+            "REJECT",
+            "tabletop_mask_no_frames",
+            "No frames were available for tabletop mask screening",
+        )
+        return {
+            "enabled": True,
+            "status": "REJECT",
+            "frame_indices": [],
+            "plane_reference_pixels_uv": plane_points.tolist(),
+            "frames": [],
+            "issues": scan_issues,
+        }
+
+    frame_reports: list[dict[str, Any]] = []
+    for index in sorted(set(int(value) for value in frame_indices)):
+        frame = frame_cache.get(index)
+        if frame is None:
+            add_issue(
+                "REJECT",
+                "tabletop_mask_frame_unavailable",
+                "A requested tabletop mask frame was not decoded",
+                frame_index=index,
+            )
+            frame_reports.append(
+                {"frame_index": index, "status": "REJECT", "error": "frame unavailable"}
+            )
+            continue
+        try:
+            plane = fit_plane_from_pixels(
+                plane_points, frame.depth_m, frame.intrinsics
+            )
+            mask = tabletop_foreground_mask(
+                frame.depth_m,
+                frame.intrinsics,
+                plane,
+                min_height_m=min_height_m,
+                roi_xyxy=mask_roi,
+                min_component_area=min_component_area,
+                close_kernel=close_kernel,
+            )
+            components = _mask_component_summary(mask)
+        except (
+            FileNotFoundError,
+            IndexError,
+            NotADirectoryError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            add_issue(
+                "REJECT",
+                "tabletop_mask_frame_invalid",
+                f"Tabletop mask screening failed for frame {index}: {exc}",
+                frame_index=index,
+            )
+            frame_reports.append(
+                {"frame_index": index, "status": "REJECT", "error": str(exc)}
+            )
+            continue
+
+        valid_depth_count = int(frame.valid_depth_mask.sum())
+        mask_count = int(mask.sum())
+        mask_ratio = float(mask_count / mask.size)
+        frame_report: dict[str, Any] = {
+            "frame_index": index,
+            "status": "PASS",
+            "rgb_depth_timestamp_difference_ms": frame.timestamp_difference_ms,
+            "invalid_depth_ratio": frame.invalid_depth_ratio,
+            "valid_depth_count": valid_depth_count,
+            "plane_normal": plane.normal.tolist(),
+            "plane_offset": plane.offset,
+            "plane_sample_count": plane.sample_count,
+            "plane_rms_residual_m": plane.rms_residual_m,
+            "mask_pixel_count": mask_count,
+            "mask_pixel_ratio": mask_ratio,
+            "mask_ratio_of_valid_depth": (
+                float(mask_count / valid_depth_count) if valid_depth_count else 0.0
+            ),
+            **components,
+        }
+        if plane.rms_residual_m > thresholds.tabletop_plane_residual_reject_m:
+            frame_report["status"] = "REJECT"
+            add_issue(
+                "REJECT",
+                "tabletop_plane_residual_too_high",
+                "The tabletop reference samples do not fit a sufficiently stable plane",
+                frame_index=index,
+                rms_residual_m=plane.rms_residual_m,
+                threshold_m=thresholds.tabletop_plane_residual_reject_m,
+            )
+        elif plane.rms_residual_m > thresholds.tabletop_plane_residual_warn_m:
+            frame_report["status"] = "WARN"
+            add_issue(
+                "WARN",
+                "tabletop_plane_residual_high",
+                "The tabletop plane fit residual is higher than the warning threshold",
+                frame_index=index,
+                rms_residual_m=plane.rms_residual_m,
+                threshold_m=thresholds.tabletop_plane_residual_warn_m,
+            )
+        if mask_count == 0:
+            frame_report["status"] = "REJECT"
+            add_issue(
+                "REJECT",
+                "tabletop_mask_empty",
+                "The tabletop foreground mask contains no pixels",
+                frame_index=index,
+            )
+        elif mask_ratio > thresholds.tabletop_mask_ratio_warn_max:
+            if frame_report["status"] == "PASS":
+                frame_report["status"] = "WARN"
+            add_issue(
+                "WARN",
+                "tabletop_mask_too_broad",
+                "The tabletop foreground mask covers an unusually large image area",
+                frame_index=index,
+                mask_pixel_ratio=mask_ratio,
+                threshold=thresholds.tabletop_mask_ratio_warn_max,
+            )
+        frame_reports.append(frame_report)
+
+    return {
+        "enabled": True,
+        "status": _status_for_issues(scan_issues),
+        "frame_indices": [int(index) for index in sorted(set(frame_indices))],
+        "plane_reference_pixels_uv": plane_points.tolist(),
+        "mask_roi_xyxy": list(mask_roi) if mask_roi is not None else None,
+        "min_height_m": min_height_m,
+        "min_component_area": min_component_area,
+        "close_kernel": close_kernel,
+        "thresholds": {
+            "plane_residual_warn_m": thresholds.tabletop_plane_residual_warn_m,
+            "plane_residual_reject_m": thresholds.tabletop_plane_residual_reject_m,
+            "mask_ratio_warn_max": thresholds.tabletop_mask_ratio_warn_max,
+        },
+        "frames": frame_reports,
+        "issues": scan_issues,
     }
 
 
@@ -192,13 +607,66 @@ def _pair_check(
     ransac_threshold_m: float,
     thresholds: QualityThresholds,
     issues: list[dict[str, Any]],
+    reference_roi: Sequence[int] | None = None,
+    query_roi: Sequence[int] | None = None,
+    reference_polygon: Sequence[Sequence[float]] | Sequence[float] | None = None,
+    query_polygon: Sequence[Sequence[float]] | Sequence[float] | None = None,
 ) -> dict[str, Any]:
     if backend != "sift":
         raise ValueError("The sequence quality gate currently supports only the SIFT backend")
 
     try:
-        reference_features = extract_opencv_features(reference.rgb, backend)
-        query_features = extract_opencv_features(query.rgb, backend)
+        reference_mask = build_feature_mask(
+            reference.rgb.shape,
+            roi_xyxy=reference_roi,
+            polygon_xy=reference_polygon,
+        )
+        query_mask = build_feature_mask(
+            query.rgb.shape,
+            roi_xyxy=query_roi,
+            polygon_xy=query_polygon,
+        )
+    except ValueError as exc:
+        mask_error_code = (
+            "feature_mask_invalid"
+            if reference_roi is not None
+            and query_roi is not None
+            and (reference_polygon is not None or query_polygon is not None)
+            else "polygon_invalid"
+            if reference_polygon is not None or query_polygon is not None
+            else "roi_invalid"
+        )
+        _issue(
+            issues,
+            "REJECT",
+            mask_error_code,
+            f"The selected pair feature mask is invalid: {exc}",
+            "pair",
+        )
+        result: dict[str, Any] = {
+            "status": "REJECT",
+            "backend": backend,
+            "reference_index": reference.frame_index,
+            "query_index": query.frame_index,
+            "error": str(exc),
+        }
+        if reference_roi is not None:
+            result["reference_roi_xyxy"] = list(reference_roi)
+        if query_roi is not None:
+            result["query_roi_xyxy"] = list(query_roi)
+        if reference_polygon is not None:
+            result["reference_polygon_xy"] = list(reference_polygon)
+        if query_polygon is not None:
+            result["query_polygon_xy"] = list(query_polygon)
+        return result
+
+    try:
+        reference_features = extract_opencv_features(
+            reference.rgb, backend, mask=reference_mask
+        )
+        query_features = extract_opencv_features(
+            query.rgb, backend, mask=query_mask
+        )
     except (ImportError, RuntimeError) as exc:
         _issue(
             issues,
@@ -224,6 +692,14 @@ def _pair_check(
         "top_fraction": top_fraction,
         "ransac_threshold_m": ransac_threshold_m,
     }
+    if reference_roi is not None:
+        result["reference_roi_xyxy"] = list(reference_roi)
+    if query_roi is not None:
+        result["query_roi_xyxy"] = list(query_roi)
+    if reference_polygon is not None:
+        result["reference_polygon_xy"] = list(reference_polygon)
+    if query_polygon is not None:
+        result["query_polygon_xy"] = list(query_polygon)
 
     if min(len(reference_features.uv), len(query_features.uv)) < thresholds.min_sift_features_reject:
         _issue(
@@ -370,6 +846,23 @@ def screen_realsense_session(
     thresholds: QualityThresholds | None = None,
     check_features: bool = True,
     full_scan: bool = False,
+    motion_scan: bool = False,
+    motion_roi: Sequence[int] | None = None,
+    motion_window: int = 5,
+    motion_quantile: float = 0.95,
+    motion_min_score: float = 0.01,
+    min_stable_frames: int = 15,
+    reference_roi: Sequence[int] | None = None,
+    query_roi: Sequence[int] | None = None,
+    reference_polygon: Sequence[Sequence[float]] | Sequence[float] | None = None,
+    query_polygon: Sequence[Sequence[float]] | Sequence[float] | None = None,
+    review_manifest: str | Path | None = None,
+    tabletop_plane_points: Sequence[Sequence[float]] | Sequence[float] | None = None,
+    tabletop_mask_frames: Sequence[int] | None = None,
+    tabletop_mask_roi: Sequence[int] | None = None,
+    tabletop_min_height_m: float = 0.015,
+    tabletop_min_component_area: int = 0,
+    tabletop_close_kernel: int = 0,
 ) -> dict[str, Any]:
     """Screen one recorded session without modifying it.
 
@@ -381,6 +874,8 @@ def screen_realsense_session(
     session = Path(session_dir)
     thresholds = thresholds or QualityThresholds()
     issues: list[dict[str, Any]] = []
+    decode_all = full_scan or motion_scan
+    tabletop_indices: list[int] = []
     if not session.is_dir():
         _issue(
             issues,
@@ -407,6 +902,28 @@ def screen_realsense_session(
             "code": "frames_invalid",
             "message": str(exc),
         }])
+
+    if tabletop_plane_points is not None:
+        if tabletop_mask_frames is None:
+            tabletop_indices = _select_sample_indices(frame_indices, sample_count)
+        else:
+            tabletop_indices = [
+                int(index) for index in tabletop_mask_frames
+            ]
+        tabletop_indices.extend(
+            int(index)
+            for index in (reference_index, query_index)
+            if index is not None
+        )
+        tabletop_indices = sorted(set(tabletop_indices))
+    elif tabletop_mask_frames is not None:
+        _issue(
+            issues,
+            "REJECT",
+            "tabletop_mask_config_invalid",
+            "tabletop_mask_frames requires tabletop_plane_points",
+            "recording",
+        )
 
     if metadata.get("status") != "complete":
         _issue(
@@ -620,9 +1137,13 @@ def screen_realsense_session(
 
     invalid_ratios: list[float] = []
     far_ratios: list[float] = []
-    decode_indices = frame_indices if full_scan else _select_sample_indices(frame_indices, sample_count)
+    decode_indices = frame_indices if decode_all else _select_sample_indices(frame_indices, sample_count)
     decode_indices = sorted(
-        set(decode_indices + [index for index in (reference_index, query_index) if index is not None])
+        set(
+            decode_indices
+            + [index for index in (reference_index, query_index) if index is not None]
+            + tabletop_indices
+        )
     )
     for index in decode_indices:
         try:
@@ -647,7 +1168,7 @@ def screen_realsense_session(
     invalid_reject = [ratio for ratio in invalid_ratios if ratio > thresholds.invalid_depth_reject_ratio]
     far_bad = [ratio for ratio in far_ratios if ratio > thresholds.far_depth_warn_ratio]
     depth_summary: dict[str, Any] = {
-        "decode_mode": "full" if full_scan else "sampled",
+        "decode_mode": "full" if decode_all else "sampled",
         "frames_checked": len(invalid_ratios),
         "frames_available": len(frame_indices),
         "invalid_depth_ratio_min": min(invalid_ratios) if invalid_ratios else None,
@@ -689,6 +1210,55 @@ def screen_realsense_session(
             frames=len(far_bad),
             threshold_m=thresholds.far_depth_warn_m,
             ratio_threshold=thresholds.far_depth_warn_ratio,
+        )
+
+    motion_report: dict[str, Any] | None = None
+    if motion_scan:
+        if frame_errors or len(frame_cache) != len(frame_indices):
+            _issue(
+                issues,
+                "REJECT",
+                "motion_scan_unavailable",
+                "Motion scan requires every recorded frame to decode successfully",
+                "recording",
+                decoded_frames=len(frame_cache),
+                expected_frames=len(frame_indices),
+            )
+        else:
+            try:
+                motion_report = _motion_profile(
+                    [frame_cache[index] for index in frame_indices],
+                    motion_roi=motion_roi,
+                    comparison_window=motion_window,
+                    motion_quantile=motion_quantile,
+                    minimum_score=motion_min_score,
+                    minimum_stable_frames=min_stable_frames,
+                )
+            except (TypeError, ValueError) as exc:
+                _issue(issues, "REJECT", "motion_scan_invalid", str(exc), "recording")
+            else:
+                if not motion_report["stable_segments"]:
+                    _issue(
+                        issues,
+                        "WARN",
+                        "stable_segment_not_found",
+                        "Motion scan did not find a stable frame segment of the requested length",
+                        "recording",
+                        minimum_stable_frames=min_stable_frames,
+                    )
+
+    tabletop_mask_report: dict[str, Any] | None = None
+    if tabletop_plane_points is not None:
+        tabletop_mask_report = _tabletop_mask_scan(
+            frame_cache,
+            tabletop_indices,
+            tabletop_plane_points,
+            mask_roi=tabletop_mask_roi,
+            min_height_m=tabletop_min_height_m,
+            min_component_area=tabletop_min_component_area,
+            close_kernel=tabletop_close_kernel,
+            thresholds=thresholds,
+            issues=issues,
         )
 
     sample_indices = _select_sample_indices(frame_indices, sample_count)
@@ -747,14 +1317,33 @@ def screen_realsense_session(
         )
         pair_status = "REJECT"
     elif reference_index is None:
-        _issue(
-            issues,
-            "WARN",
-            "pair_check_not_run",
-            "No reference/query frame pair was supplied; recording integrity alone is not experimental eligibility",
-            "pair",
-        )
-        pair_status = "NOT_RUN"
+        if review_manifest is not None:
+            _issue(
+                issues,
+                "REJECT",
+                "review_requires_pair",
+                "A review manifest requires both reference_index and query_index",
+                "pair",
+            )
+            pair_status = "REJECT"
+            pair_check = {
+                "status": "REJECT",
+                "error": "review manifest requires an explicit frame pair",
+                "review_manifest": str(Path(review_manifest).resolve()),
+            }
+            # Do not also report the generic pair-not-run warning.
+            report_pair_not_run = False
+        else:
+            report_pair_not_run = True
+        if report_pair_not_run:
+            _issue(
+                issues,
+                "WARN",
+                "pair_check_not_run",
+                "No reference/query frame pair was supplied; recording integrity alone is not experimental eligibility",
+                "pair",
+            )
+            pair_status = "NOT_RUN"
     elif reference_index == query_index:
         _issue(
             issues,
@@ -776,16 +1365,59 @@ def screen_realsense_session(
         )
         pair_status = "REJECT"
     else:
-        pair_check = _pair_check(
-            frame_cache[reference_index],
-            frame_cache[query_index],
-            backend,
-            min_similarity,
-            top_fraction,
-            ransac_threshold_m,
-            thresholds,
-            issues,
-        )
+        if review_manifest is not None:
+            try:
+                review_info = validate_approved_pair(
+                    review_manifest, reference_index, query_index
+                )
+            except (OSError, ValueError) as exc:
+                _issue(
+                    issues,
+                    "REJECT",
+                    "review_not_approved",
+                    str(exc),
+                    "pair",
+                    review_manifest=str(Path(review_manifest).resolve()),
+                )
+                pair_check = {
+                    "status": "REJECT",
+                    "backend": backend,
+                    "reference_index": reference_index,
+                    "query_index": query_index,
+                    "review_manifest": str(Path(review_manifest).resolve()),
+                    "error": str(exc),
+                }
+            else:
+                pair_check = _pair_check(
+                    frame_cache[reference_index],
+                    frame_cache[query_index],
+                    backend,
+                    min_similarity,
+                    top_fraction,
+                    ransac_threshold_m,
+                    thresholds,
+                    issues,
+                    reference_roi=reference_roi,
+                    query_roi=query_roi,
+                    reference_polygon=reference_polygon,
+                    query_polygon=query_polygon,
+                )
+                pair_check["review_manifest"] = review_info
+        else:
+            pair_check = _pair_check(
+                frame_cache[reference_index],
+                frame_cache[query_index],
+                backend,
+                min_similarity,
+                top_fraction,
+                ransac_threshold_m,
+                thresholds,
+                issues,
+                reference_roi=reference_roi,
+                query_roi=query_roi,
+                reference_polygon=reference_polygon,
+                query_polygon=query_polygon,
+            )
         pair_status = str(pair_check["status"])
 
     report: dict[str, Any] = {
@@ -793,6 +1425,9 @@ def screen_realsense_session(
         "session": str(session.resolve()),
         "status": _status_for_issues(issues),
         "eligible_for_experiment": _status_for_issues(issues) == "PASS",
+        "manual_review_required": bool(
+            motion_report is not None and motion_report["manual_review_required"]
+        ),
         "recording_status": _status_for_issues(issues, "recording"),
         "pair_status": pair_status,
         "issues": issues,
@@ -816,6 +1451,8 @@ def screen_realsense_session(
             "depth": depth_summary,
             "samples": samples,
         },
+        "motion_scan": motion_report,
+        "tabletop_mask_scan": tabletop_mask_report,
         "pair_check": pair_check,
         "thresholds": {
             key: value for key, value in vars(thresholds).items()
