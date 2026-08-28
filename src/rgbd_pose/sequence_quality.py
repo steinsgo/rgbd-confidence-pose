@@ -20,6 +20,7 @@ from PIL import Image
 from .features import build_feature_mask, extract_opencv_features, rectangular_roi_mask
 from .geometry import backproject_pixels
 from .matching import combine_confidence, mutual_nearest_matches
+from .plane_mask import fit_plane_from_pixels, tabletop_foreground_mask
 from .pose import estimate_pose_ransac
 from .quality_review import validate_approved_pair
 from .realsense_sequence import RealSenseFrame, load_realsense_sequence_frame
@@ -44,6 +45,9 @@ class QualityThresholds:
     min_valid_3d_matches: int = 6
     min_ransac_inliers: int = 6
     min_inlier_ratio: float = 0.50
+    tabletop_plane_residual_warn_m: float = 0.010
+    tabletop_plane_residual_reject_m: float = 0.030
+    tabletop_mask_ratio_warn_max: float = 0.30
 
 
 def _issue(
@@ -351,6 +355,249 @@ def _frame_error_summary(index: int, exc: Exception) -> dict[str, Any]:
     }
 
 
+def _normalize_tabletop_plane_points(
+    points_uv: Sequence[Sequence[float]] | Sequence[float] | np.ndarray,
+) -> np.ndarray:
+    try:
+        points = np.asarray(points_uv, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("tabletop plane points must be numeric") from exc
+    if points.ndim == 1:
+        if points.size < 6 or points.size % 2:
+            raise ValueError(
+                "tabletop plane points require at least three x,y pairs"
+            )
+        points = points.reshape(-1, 2)
+    elif points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError(
+            "tabletop plane points must have shape (N, 2) or be a flat x,y sequence"
+        )
+    if len(points) < 3:
+        raise ValueError("tabletop plane points require at least three samples")
+    if not np.isfinite(points).all():
+        raise ValueError("tabletop plane points must be finite")
+    return points
+
+
+def _mask_component_summary(mask: np.ndarray) -> dict[str, Any]:
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError(
+            "OpenCV is required for tabletop mask connected-component screening"
+        ) from exc
+    mask_array = np.asarray(mask, dtype=bool)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask_array.astype(np.uint8), connectivity=8
+    )
+    if count <= 1:
+        return {
+            "component_count": 0,
+            "largest_component_area": 0,
+            "largest_component_ratio": 0.0,
+            "largest_component_bbox_xyxy": None,
+            "component_areas_descending": [],
+        }
+    areas = stats[1:, cv2.CC_STAT_AREA].astype(np.int64)
+    order = np.argsort(areas)[::-1]
+    largest_index = int(order[0]) + 1
+    largest_area = int(areas[order[0]])
+    total_area = int(areas.sum())
+    x = int(stats[largest_index, cv2.CC_STAT_LEFT])
+    y = int(stats[largest_index, cv2.CC_STAT_TOP])
+    width = int(stats[largest_index, cv2.CC_STAT_WIDTH])
+    height = int(stats[largest_index, cv2.CC_STAT_HEIGHT])
+    return {
+        "component_count": int(len(areas)),
+        "largest_component_area": largest_area,
+        "largest_component_ratio": (
+            float(largest_area / total_area) if total_area else 0.0
+        ),
+        "largest_component_bbox_xyxy": [x, y, x + width, y + height],
+        "component_areas_descending": [int(areas[index]) for index in order[:5]],
+    }
+
+
+def _tabletop_mask_scan(
+    frame_cache: dict[int, RealSenseFrame],
+    frame_indices: Sequence[int],
+    plane_points_uv: Sequence[Sequence[float]] | Sequence[float] | np.ndarray,
+    *,
+    mask_roi: Sequence[int] | None,
+    min_height_m: float,
+    min_component_area: int,
+    close_kernel: int,
+    thresholds: QualityThresholds,
+    issues: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Screen a small set of frames with a read-only tabletop foreground mask."""
+
+    scan_issues: list[dict[str, Any]] = []
+
+    def add_issue(
+        severity: Literal["WARN", "REJECT"],
+        code: str,
+        message: str,
+        **details: Any,
+    ) -> None:
+        _issue(scan_issues, severity, code, message, "recording", **details)
+        _issue(issues, severity, code, message, "recording", **details)
+
+    try:
+        plane_points = _normalize_tabletop_plane_points(plane_points_uv)
+    except ValueError as exc:
+        add_issue("REJECT", "tabletop_plane_points_invalid", str(exc))
+        return {
+            "enabled": True,
+            "status": "REJECT",
+            "frame_indices": [int(index) for index in frame_indices],
+            "plane_reference_pixels_uv": None,
+            "frames": [],
+            "issues": scan_issues,
+        }
+
+    if not frame_indices:
+        add_issue(
+            "REJECT",
+            "tabletop_mask_no_frames",
+            "No frames were available for tabletop mask screening",
+        )
+        return {
+            "enabled": True,
+            "status": "REJECT",
+            "frame_indices": [],
+            "plane_reference_pixels_uv": plane_points.tolist(),
+            "frames": [],
+            "issues": scan_issues,
+        }
+
+    frame_reports: list[dict[str, Any]] = []
+    for index in sorted(set(int(value) for value in frame_indices)):
+        frame = frame_cache.get(index)
+        if frame is None:
+            add_issue(
+                "REJECT",
+                "tabletop_mask_frame_unavailable",
+                "A requested tabletop mask frame was not decoded",
+                frame_index=index,
+            )
+            frame_reports.append(
+                {"frame_index": index, "status": "REJECT", "error": "frame unavailable"}
+            )
+            continue
+        try:
+            plane = fit_plane_from_pixels(
+                plane_points, frame.depth_m, frame.intrinsics
+            )
+            mask = tabletop_foreground_mask(
+                frame.depth_m,
+                frame.intrinsics,
+                plane,
+                min_height_m=min_height_m,
+                roi_xyxy=mask_roi,
+                min_component_area=min_component_area,
+                close_kernel=close_kernel,
+            )
+            components = _mask_component_summary(mask)
+        except (
+            FileNotFoundError,
+            IndexError,
+            NotADirectoryError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            add_issue(
+                "REJECT",
+                "tabletop_mask_frame_invalid",
+                f"Tabletop mask screening failed for frame {index}: {exc}",
+                frame_index=index,
+            )
+            frame_reports.append(
+                {"frame_index": index, "status": "REJECT", "error": str(exc)}
+            )
+            continue
+
+        valid_depth_count = int(frame.valid_depth_mask.sum())
+        mask_count = int(mask.sum())
+        mask_ratio = float(mask_count / mask.size)
+        frame_report: dict[str, Any] = {
+            "frame_index": index,
+            "status": "PASS",
+            "rgb_depth_timestamp_difference_ms": frame.timestamp_difference_ms,
+            "invalid_depth_ratio": frame.invalid_depth_ratio,
+            "valid_depth_count": valid_depth_count,
+            "plane_normal": plane.normal.tolist(),
+            "plane_offset": plane.offset,
+            "plane_sample_count": plane.sample_count,
+            "plane_rms_residual_m": plane.rms_residual_m,
+            "mask_pixel_count": mask_count,
+            "mask_pixel_ratio": mask_ratio,
+            "mask_ratio_of_valid_depth": (
+                float(mask_count / valid_depth_count) if valid_depth_count else 0.0
+            ),
+            **components,
+        }
+        if plane.rms_residual_m > thresholds.tabletop_plane_residual_reject_m:
+            frame_report["status"] = "REJECT"
+            add_issue(
+                "REJECT",
+                "tabletop_plane_residual_too_high",
+                "The tabletop reference samples do not fit a sufficiently stable plane",
+                frame_index=index,
+                rms_residual_m=plane.rms_residual_m,
+                threshold_m=thresholds.tabletop_plane_residual_reject_m,
+            )
+        elif plane.rms_residual_m > thresholds.tabletop_plane_residual_warn_m:
+            frame_report["status"] = "WARN"
+            add_issue(
+                "WARN",
+                "tabletop_plane_residual_high",
+                "The tabletop plane fit residual is higher than the warning threshold",
+                frame_index=index,
+                rms_residual_m=plane.rms_residual_m,
+                threshold_m=thresholds.tabletop_plane_residual_warn_m,
+            )
+        if mask_count == 0:
+            frame_report["status"] = "REJECT"
+            add_issue(
+                "REJECT",
+                "tabletop_mask_empty",
+                "The tabletop foreground mask contains no pixels",
+                frame_index=index,
+            )
+        elif mask_ratio > thresholds.tabletop_mask_ratio_warn_max:
+            if frame_report["status"] == "PASS":
+                frame_report["status"] = "WARN"
+            add_issue(
+                "WARN",
+                "tabletop_mask_too_broad",
+                "The tabletop foreground mask covers an unusually large image area",
+                frame_index=index,
+                mask_pixel_ratio=mask_ratio,
+                threshold=thresholds.tabletop_mask_ratio_warn_max,
+            )
+        frame_reports.append(frame_report)
+
+    return {
+        "enabled": True,
+        "status": _status_for_issues(scan_issues),
+        "frame_indices": [int(index) for index in sorted(set(frame_indices))],
+        "plane_reference_pixels_uv": plane_points.tolist(),
+        "mask_roi_xyxy": list(mask_roi) if mask_roi is not None else None,
+        "min_height_m": min_height_m,
+        "min_component_area": min_component_area,
+        "close_kernel": close_kernel,
+        "thresholds": {
+            "plane_residual_warn_m": thresholds.tabletop_plane_residual_warn_m,
+            "plane_residual_reject_m": thresholds.tabletop_plane_residual_reject_m,
+            "mask_ratio_warn_max": thresholds.tabletop_mask_ratio_warn_max,
+        },
+        "frames": frame_reports,
+        "issues": scan_issues,
+    }
+
+
 def _pair_check(
     reference: RealSenseFrame,
     query: RealSenseFrame,
@@ -610,6 +857,12 @@ def screen_realsense_session(
     reference_polygon: Sequence[Sequence[float]] | Sequence[float] | None = None,
     query_polygon: Sequence[Sequence[float]] | Sequence[float] | None = None,
     review_manifest: str | Path | None = None,
+    tabletop_plane_points: Sequence[Sequence[float]] | Sequence[float] | None = None,
+    tabletop_mask_frames: Sequence[int] | None = None,
+    tabletop_mask_roi: Sequence[int] | None = None,
+    tabletop_min_height_m: float = 0.015,
+    tabletop_min_component_area: int = 0,
+    tabletop_close_kernel: int = 0,
 ) -> dict[str, Any]:
     """Screen one recorded session without modifying it.
 
@@ -622,6 +875,7 @@ def screen_realsense_session(
     thresholds = thresholds or QualityThresholds()
     issues: list[dict[str, Any]] = []
     decode_all = full_scan or motion_scan
+    tabletop_indices: list[int] = []
     if not session.is_dir():
         _issue(
             issues,
@@ -648,6 +902,28 @@ def screen_realsense_session(
             "code": "frames_invalid",
             "message": str(exc),
         }])
+
+    if tabletop_plane_points is not None:
+        if tabletop_mask_frames is None:
+            tabletop_indices = _select_sample_indices(frame_indices, sample_count)
+        else:
+            tabletop_indices = [
+                int(index) for index in tabletop_mask_frames
+            ]
+        tabletop_indices.extend(
+            int(index)
+            for index in (reference_index, query_index)
+            if index is not None
+        )
+        tabletop_indices = sorted(set(tabletop_indices))
+    elif tabletop_mask_frames is not None:
+        _issue(
+            issues,
+            "REJECT",
+            "tabletop_mask_config_invalid",
+            "tabletop_mask_frames requires tabletop_plane_points",
+            "recording",
+        )
 
     if metadata.get("status") != "complete":
         _issue(
@@ -863,7 +1139,11 @@ def screen_realsense_session(
     far_ratios: list[float] = []
     decode_indices = frame_indices if decode_all else _select_sample_indices(frame_indices, sample_count)
     decode_indices = sorted(
-        set(decode_indices + [index for index in (reference_index, query_index) if index is not None])
+        set(
+            decode_indices
+            + [index for index in (reference_index, query_index) if index is not None]
+            + tabletop_indices
+        )
     )
     for index in decode_indices:
         try:
@@ -966,6 +1246,20 @@ def screen_realsense_session(
                         "recording",
                         minimum_stable_frames=min_stable_frames,
                     )
+
+    tabletop_mask_report: dict[str, Any] | None = None
+    if tabletop_plane_points is not None:
+        tabletop_mask_report = _tabletop_mask_scan(
+            frame_cache,
+            tabletop_indices,
+            tabletop_plane_points,
+            mask_roi=tabletop_mask_roi,
+            min_height_m=tabletop_min_height_m,
+            min_component_area=tabletop_min_component_area,
+            close_kernel=tabletop_close_kernel,
+            thresholds=thresholds,
+            issues=issues,
+        )
 
     sample_indices = _select_sample_indices(frame_indices, sample_count)
     sample_indices = sorted(set(sample_indices + [index for index in (reference_index, query_index) if index is not None]))
@@ -1158,6 +1452,7 @@ def screen_realsense_session(
             "samples": samples,
         },
         "motion_scan": motion_report,
+        "tabletop_mask_scan": tabletop_mask_report,
         "pair_check": pair_check,
         "thresholds": {
             key: value for key, value in vars(thresholds).items()

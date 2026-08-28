@@ -64,6 +64,50 @@ def main() -> int:
         help="restrict pair-check SIFT features to query polygon x0 y0 x1 y1 ...",
     )
     parser.add_argument(
+        "--tabletop-mask",
+        action="store_true",
+        help="screen a depth-based tabletop foreground mask on representative frames",
+    )
+    parser.add_argument(
+        "--tabletop-plane-points",
+        nargs="+",
+        type=float,
+        metavar="COORD",
+        help="table-plane reference pixels x0 y0 x1 y1 ...; requires --tabletop-mask",
+    )
+    parser.add_argument(
+        "--tabletop-mask-frames",
+        nargs="+",
+        type=int,
+        metavar="INDEX",
+        help="optional explicit frames; otherwise sample-count frames plus pair frames",
+    )
+    parser.add_argument(
+        "--tabletop-mask-roi",
+        nargs=4,
+        type=int,
+        metavar=("X0", "Y0", "X1", "Y1"),
+        help="optional ROI applied to the tabletop foreground mask",
+    )
+    parser.add_argument(
+        "--tabletop-min-height-m",
+        type=float,
+        default=0.015,
+        help="minimum distance from the fitted tabletop plane (default: 0.015)",
+    )
+    parser.add_argument(
+        "--tabletop-min-component-area",
+        type=int,
+        default=0,
+        help="remove mask components smaller than this area (default: 0)",
+    )
+    parser.add_argument(
+        "--tabletop-close-kernel",
+        type=int,
+        default=0,
+        help="optional odd morphology closing kernel (default: 0)",
+    )
+    parser.add_argument(
         "--full-scan",
         action="store_true",
         help="decode every RGB/depth pair; default checks all references and decodes samples",
@@ -117,6 +161,22 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.tabletop_mask and args.tabletop_plane_points is None:
+        parser.error("--tabletop-mask requires --tabletop-plane-points")
+    if not args.tabletop_mask and any(
+        value is not None
+        for value in (
+            args.tabletop_plane_points,
+            args.tabletop_mask_frames,
+            args.tabletop_mask_roi,
+        )
+    ):
+        parser.error("tabletop mask options require --tabletop-mask")
+    if args.tabletop_min_component_area < 0:
+        parser.error("--tabletop-min-component-area must be non-negative")
+    if args.tabletop_close_kernel < 0:
+        parser.error("--tabletop-close-kernel must be non-negative")
+
     report = screen_realsense_session(
         args.session,
         reference_index=args.reference_index,
@@ -138,6 +198,16 @@ def main() -> int:
         reference_polygon=args.reference_polygon,
         query_polygon=args.query_polygon,
         review_manifest=args.review_manifest,
+        tabletop_plane_points=(
+            args.tabletop_plane_points if args.tabletop_mask else None
+        ),
+        tabletop_mask_frames=(
+            args.tabletop_mask_frames if args.tabletop_mask else None
+        ),
+        tabletop_mask_roi=args.tabletop_mask_roi if args.tabletop_mask else None,
+        tabletop_min_height_m=args.tabletop_min_height_m,
+        tabletop_min_component_area=args.tabletop_min_component_area,
+        tabletop_close_kernel=args.tabletop_close_kernel,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

@@ -15,6 +15,46 @@ class PoseEstimate:
     weighted_rmse_m: float
 
 
+def summarize_pose_estimate(
+    estimate: PoseEstimate,
+    weights: np.ndarray | None = None,
+) -> dict[str, object]:
+    """Return comparable geometric metrics for one pose estimate.
+
+    ``weights=None`` gives ordinary uniform RMSE.  Supplying confidence values
+    additionally reports confidence-weighted RMSE over that estimate's own
+    inliers.  The estimate itself is never modified.
+    """
+    residuals = np.asarray(estimate.residuals_m, dtype=np.float64)
+    inliers = np.asarray(estimate.inliers, dtype=bool)
+    if residuals.ndim != 1 or inliers.shape != residuals.shape:
+        raise ValueError("estimate residuals and inliers must have matching 1-D shapes")
+    if not np.any(inliers):
+        raise ValueError("pose estimate must contain at least one inlier")
+
+    if weights is None:
+        effective_weights = np.ones(residuals.shape, dtype=np.float64)
+    else:
+        effective_weights = np.asarray(weights, dtype=np.float64)
+        if effective_weights.shape != residuals.shape:
+            raise ValueError("weights must match the number of residuals")
+        effective_weights = np.maximum(effective_weights, 0.0)
+    inlier_weights = effective_weights[inliers]
+    if inlier_weights.sum() <= 0:
+        raise ValueError("inlier weights must have positive sum")
+
+    inlier_residuals = residuals[inliers]
+    return {
+        "inliers": int(inliers.sum()),
+        "inlier_ratio": float(inliers.mean()),
+        "rmse_m": float(np.sqrt(np.mean(inlier_residuals**2))),
+        "weighted_rmse_m": float(
+            np.sqrt(np.average(inlier_residuals**2, weights=inlier_weights))
+        ),
+        "transform_reference_to_query": estimate.transform.tolist(),
+    }
+
+
 def weighted_rigid_transform(
     source: np.ndarray, target: np.ndarray, weights: np.ndarray | None = None
 ) -> np.ndarray:
@@ -87,3 +127,40 @@ def estimate_pose_ransac(
     inliers = residuals < threshold_m
     rmse = float(np.sqrt(np.average(residuals[inliers] ** 2, weights=conf[inliers])))
     return PoseEstimate(transform, inliers, residuals, rmse)
+
+
+def estimate_pose_comparison(
+    source: np.ndarray,
+    target: np.ndarray,
+    confidence: np.ndarray,
+    threshold_m: float = 0.025,
+    iterations: int = 1500,
+    seed: int = 0,
+) -> tuple[PoseEstimate, PoseEstimate]:
+    """Estimate weighted and uniform poses from identical correspondences.
+
+    Both estimates use the same threshold, iteration count, and random seed.
+    The weighted estimate uses ``confidence`` for sampling, scoring, and its
+    final rigid fit.  The baseline uses uniform sampling, scoring, and fit by
+    passing ``confidence=None``.
+    """
+    confidence = np.asarray(confidence, dtype=np.float64)
+    if confidence.ndim != 1 or confidence.shape[0] != len(source):
+        raise ValueError("confidence must contain one value per correspondence")
+    weighted = estimate_pose_ransac(
+        source,
+        target,
+        confidence,
+        threshold_m=threshold_m,
+        iterations=iterations,
+        seed=seed,
+    )
+    unweighted = estimate_pose_ransac(
+        source,
+        target,
+        None,
+        threshold_m=threshold_m,
+        iterations=iterations,
+        seed=seed,
+    )
+    return weighted, unweighted

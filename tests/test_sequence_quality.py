@@ -144,6 +144,45 @@ def test_quality_report_rejects_missing_recorded_file(tmp_path):
     assert any(issue["code"] == "referenced_file_missing" for issue in report["issues"])
 
 
+def test_quality_report_runs_tabletop_mask_scan(tmp_path):
+    session = _write_quality_session(tmp_path)
+    for index in range(2):
+        depth = np.full((2, 2), 1000, dtype=np.uint16)
+        depth[1, 1] = 900
+        Image.fromarray(depth).save(session / "depth" / f"{index:06d}.png")
+
+    report = screen_realsense_session(
+        session,
+        check_features=False,
+        sample_count=1,
+        tabletop_plane_points=[0, 0, 1, 0, 0, 1],
+        tabletop_mask_frames=[1],
+        tabletop_min_height_m=0.05,
+    )
+
+    scan = report["tabletop_mask_scan"]
+    assert scan["status"] == "PASS"
+    assert scan["frame_indices"] == [1]
+    assert scan["frames"][0]["mask_pixel_count"] == 1
+    assert scan["frames"][0]["largest_component_area"] == 1
+    assert report["recording_status"] == "PASS"
+
+
+def test_quality_report_rejects_empty_tabletop_mask(tmp_path):
+    session = _write_quality_session(tmp_path)
+
+    report = screen_realsense_session(
+        session,
+        check_features=False,
+        tabletop_plane_points=[0, 0, 1, 0, 0, 1],
+        tabletop_mask_frames=[0],
+    )
+
+    assert report["tabletop_mask_scan"]["status"] == "REJECT"
+    assert any(issue["code"] == "tabletop_mask_empty" for issue in report["issues"])
+    assert report["recording_status"] == "REJECT"
+
+
 def test_quality_report_rejects_invalid_pair_roi(tmp_path):
     session = _write_quality_session(tmp_path)
 

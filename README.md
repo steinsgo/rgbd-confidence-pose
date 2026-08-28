@@ -1,58 +1,40 @@
 # Confidence-Aware RGB-D Correspondence for Unseen Object Pose Estimation
 
-Small, independent research code for matching an unseen object between two
-RGB-D observations, lifting correspondences into 3-D, and estimating a
-relative rigid transform. The project is inspired by the confidence-aware
-correspondence idea in COG, but is **not an exact reproduction of COG**.
+Small research code for matching an unseen object between two RGB-D
+observations, lifting 2-D matches into 3-D, and estimating a relative rigid
+transform. The project is inspired by the confidence-aware correspondence idea
+in COG, but it is **not an exact reproduction of COG**.
 
-The implementation is intentionally modest: OpenCV SIFT/ORB, explicit depth
-validity, heuristic appearance confidence, weighted Kabsch refinement, and
-confidence-biased RANSAC. The goal is a reproducible CPU-capable baseline that
-can be inspected before larger models or experiments are introduced.
+The current implementation is deliberately modest:
 
-## Pipeline
+- OpenCV SIFT/ORB feature matching;
+- optional DINOv2 feature matching;
+- explicit RGB-D validity checks and 2-D-to-3-D back-projection;
+- transparent heuristic correspondence confidence;
+- confidence-aware Kabsch refinement and RANSAC;
+- read-only tools for checking recorded D435i sessions.
 
-```mermaid
-flowchart TD
-    A[Windows D435i capture] --> B[Read-only RGB-D adapter]
-    B --> C[RGB + depth + intrinsics]
-    C --> D[2D SIFT/ORB matches + confidence]
-    C --> E[Depth back-projection]
-    D --> F[Confidence-aware 3D correspondences]
-    E --> F
-    F --> G[Weighted Kabsch + RANSAC]
-    G --> H[SE(3), inliers, RMSE]
-```
+For one pair, the main output is a relative `4 x 4` transform together with
+match counts, RANSAC inliers, and residual diagnostics. A transform from a
+static-camera recording is a correspondence sanity check, not automatically a
+pose-accuracy measurement.
 
-The current confidence score is a transparent heuristic, not a calibrated
-probability. No learned optimal-transport model is claimed or included.
+## Current status
 
-Recording inspection is a separate utility rather than another stage in the
-pose-estimation diagram. It produces a machine-readable eligibility report,
-and motion candidates still require visual review before a pair is approved.
-The scan never writes to the original session.
-
-## Verified status
-
-| Component | Status | Evidence level |
+| Area | Status | What has actually been checked |
 |---|---|---|
-| Custom `rgb.png` / `depth_m.npy` / `intrinsics.txt` loader | Implemented | Existing unit tests |
-| D435i sequence adapter using `frames.csv` | Implemented | Unit tests and read-only real-session decoding |
-| RGB channel and raw `uint16` depth handling | Implemented | Synthetic-session tests; `0` and `65535` invalid |
-| Camera intrinsics and 2D-to-3D back-projection | Implemented | Unit tests and real-session pair diagnostics |
-| SIFT baseline and mutual-NN matching | Implemented | CPU execution on real frames |
-| Confidence-aware weighted Kabsch/RANSAC | Implemented | Deterministic synthetic validation |
-| Read-only recording scan and eligibility report | Implemented | Unit tests and full real-session scan |
-| Rectangular reference/query feature ROI | Implemented | Unit tests and real SIFT sanity check |
-| Polygonal reference/query feature mask | Implemented | Unit tests and real-session SIFT run |
-| Read-only motion/stable-segment scan | Implemented | Deterministic tests and real-session scan |
-| Candidate RGB/depth review package | Implemented | Real-session contact sheets and manifest |
-| Explicit reviewed-pair approval gate | Implemented | Unit tests and pending/approved CLI checks |
-| DINOv2 backend | Code path only | Not installed or experimentally validated |
-| Ground-truth pose benchmark | Not available | Manual rotation is not ground truth |
-| Weighted-vs-unweighted experimental comparison | Not implemented | Deliberately out of scope for the current stage |
+| Custom frame-directory loader | Implemented | Unit tests |
+| D435i sequence adapter | Implemented | Unit tests and read-only real-session decoding |
+| Intrinsics, depth scaling, invalid-depth handling, back-projection | Implemented | Unit tests and real-frame diagnostics |
+| SIFT baseline | Implemented | CPU runs on real D435i frames |
+| Confidence-aware Kabsch/RANSAC | Implemented | Deterministic synthetic validation |
+| Recording, motion, and tabletop-depth checks | Implemented | Unit tests and read-only scans |
+| Polygon and tabletop foreground masks | Implemented (heuristic) | Unit tests and real-frame inspection; no segmentation ground truth |
+| DINOv2 backend | Experimental | Real-pair smoke runs; no ground-truth validation |
+| Weighted-vs-unweighted comparison | Diagnostic code only | No scientifically meaningful conclusion yet |
+| Ground-truth pose benchmark | Not available | Manual rotation was not independently measured |
 
-The verified synthetic run reports:
+### Verified synthetic result
 
 ```text
 inliers=105/160
@@ -61,31 +43,53 @@ rotation_error_deg=0.0839
 translation_error_m=0.001614
 ```
 
-These are synthetic results with known generated motion and outliers. They are
-not real-world measurements.
+These numbers come from a generated scene with known motion and injected
+outliers. They are not real-world measurements.
+
+### Verified D435i smoke checks
+
+The latest complete recording, `20260820_142523_animebox`, passed the recorder's
+native integrity check:
+
+- 600 color frames and 600 depth frames;
+- 2,007 accelerometer samples and 3,997 gyroscope samples;
+- RGB/depth rate about 30 FPS;
+- maximum RGB-depth timestamp difference: 10.08 ms;
+- zero video queue drops and no writer errors.
+
+The read-only adapter, tabletop mask, SIFT, and DINOv2 paths were also run on
+selected frames. The recording used a static camera and manually handled object
+motion, so its transforms are reported only as diagnostics. It is not a
+viewpoint-change benchmark, ground-truth evaluation, or claim of robustness.
 
 ## Environment
 
-The development target is:
+The intended setup is:
 
-- WSL2 Ubuntu 22.04 for CPU development and later GPU inference;
-- Python 3.10 in a project-local `.venv`;
+- WSL2 Ubuntu 22.04 for development and inference;
+- Python 3.10 in the project-local `.venv`;
 - Windows-side D435i capture with aligned color/depth;
-- offline sequence inspection from a mounted path such as `/mnt/e/...`.
+- completed sessions read from a mounted path such as `/mnt/e/...`.
 
-The CPU sequence adapter and SIFT baseline do not require direct D435i USB
-access from WSL. `pyrealsense2` is only needed by the acquisition script on a
-machine with the camera. PyTorch, Open3D, ROS, CUDA toolkits, and DINOv2 are
-not required for the current baseline.
+The CPU adapter and SIFT baseline do not need direct D435i USB access from WSL.
+PyTorch and DINOv2 are optional. Open3D, ROS, Gazebo, and Isaac Sim are not
+required.
+
+The Windows recorder and original RGB-D data are not part of the public
+research workflow here. The adapter reads a completed session without writing
+to it.
 
 ## Installation
+
+Use a project-local environment; do not install into the system or Conda base
+environment.
 
 ```bash
 source .venv/bin/activate
 pip install -e '.[vision,dev]'
 ```
 
-Run the checks:
+Basic checks:
 
 ```bash
 python -m pytest -q
@@ -93,9 +97,9 @@ python scripts/synthetic_demo.py
 python -m pip check
 ```
 
-## Data formats
+## Input data
 
-The original small pair pipeline remains compatible with frame directories:
+The original pair interface remains compatible with:
 
 ```text
 frame_directory/
@@ -104,7 +108,7 @@ frame_directory/
 └── intrinsics.txt
 ```
 
-The D435i recorder uses a read-only session directory:
+A recorded D435i session has the following relevant files:
 
 ```text
 session/
@@ -118,16 +122,13 @@ session/
 ```
 
 `frames.csv` is the authoritative RGB/depth pairing table. The adapter parses
-aligned color-camera intrinsics from `calibration.json`, converts raw `uint16`
-depth using the recorded scale, and maps raw `0` and `65535` to invalid metric
-depth `0.0`. It does not impose a hidden 3 m cutoff.
+the aligned color-camera intrinsics from `calibration.json`, decodes raw
+`uint16` depth PNGs using the recorded depth scale, and maps raw values `0` and
+`65535` to invalid metric depth `0.0`. It does not impose a hidden 3 m cutoff.
 
-Raw captures and mounted Windows paths are intentionally not part of this
-repository.
+## Quick start
 
-## Usage
-
-### Inspect one recorded frame
+### Inspect one D435i frame
 
 ```bash
 python scripts/inspect_realsense_sequence.py \
@@ -136,12 +137,13 @@ python scripts/inspect_realsense_sequence.py \
   --output results/frame_030
 ```
 
-The command writes an RGB preview, a normalized depth preview, and a JSON
-summary without modifying the session.
+This writes an RGB preview, a normalized depth preview, and a JSON summary
+outside the original session.
 
-### Screen a recording
+### Check a recording
 
-Recording-only scan:
+The normal scan checks file counts, timestamps, calibration, image decoding,
+depth validity, and sampled SIFT availability:
 
 ```bash
 python scripts/validate_experiment_candidate.py \
@@ -150,84 +152,26 @@ python scripts/validate_experiment_candidate.py \
   --output results/session_quality.json
 ```
 
-To help select static reference/query frames after recording, add the motion
-scan. It implies a full RGB-D decode and reports candidate change intervals and
-stable frame segments. A broad target ROI makes small object/hand motion more
-visible than a whole-image score:
+For a tabletop scene, the optional depth-plane check can screen a foreground
+mask. The plane points are scene-specific and must be reviewed visually:
 
 ```bash
 python scripts/validate_experiment_candidate.py \
   /mnt/e/path/to/session \
-  --motion-scan \
-  --motion-roi 160 80 480 400 \
-  --output results/session_motion_quality.json
+  --full-scan \
+  --tabletop-mask \
+  --tabletop-plane-points 80 380 550 380 80 450 550 450 \
+  --tabletop-mask-roi 180 100 450 370 \
+  --output results/session_quality.json
 ```
 
-The motion score is a low-resolution RGB difference heuristic. It identifies
-candidate changes but does not determine whether the cause was a hand, object,
-lighting, or camera motion. It is a frame-selection aid, not pose ground truth.
-Reported stable segments mean only low temporal RGB change; a hand that remains
-still can still be present, so candidate segments require visual review. When
-triggers are found, the JSON report sets `manual_review_required: true`.
+The scan is read-only with respect to the session. Its exit codes are
+`0=PASS`, `1=WARN`, and `2=REJECT`. A recording integrity pass does not by
+itself establish experimental pose eligibility.
 
-Export a small visual review package without rescanning the session:
+### Estimate a pair with SIFT
 
-```bash
-python scripts/export_motion_review.py \
-  /mnt/e/path/to/session \
-  --quality-report results/session_motion_quality.json \
-  --output results/session_motion_review
-```
-
-The output contains RGB/depth contact sheets, individual candidate-frame
-previews, and `review_manifest.json` with `PENDING_MANUAL_REVIEW` status.
-
-After visually confirming a pair, approve it explicitly:
-
-```bash
-python scripts/approve_motion_review.py \
-  results/session_motion_review/review_manifest.json \
-  --reference-index 80 \
-  --query-index 500 \
-  --note "visually checked; no hand visible in either selected frame"
-```
-
-Pass the approved manifest to the pair runner or experiment validator to
-enforce the decision. Omitting `--review-manifest` preserves the existing
-backward-compatible behavior.
-
-```bash
-python scripts/run_pair.py \
-  --session /mnt/e/path/to/session \
-  --reference-index 80 \
-  --query-index 500 \
-  --backend sift \
-  --review-manifest results/session_motion_review/review_manifest.json \
-  --output results/approved_pair.json
-```
-
-Add a pair-level SIFT/3-D check when the intended reference and query frames
-are known:
-
-```bash
-python scripts/validate_experiment_candidate.py \
-  /mnt/e/path/to/session \
-  --reference-index 60 \
-  --query-index 260 \
-  --backend sift \
-  --reference-roi 180 155 410 470 \
-  --query-roi 180 155 440 470 \
-  --output results/pair_quality.json
-```
-
-The exit codes are `0=PASS`, `1=WARN`, and `2=REJECT`. A recording-level scan
-and a pair-level decision are reported separately. A pair can pass while the
-recording remains rejected because of an unrelated warm-up frame or scan
-issue.
-
-### Estimate a pair
-
-The existing positional frame-directory interface is preserved:
+The backward-compatible frame-directory form is:
 
 ```bash
 python scripts/run_pair.py \
@@ -236,28 +180,23 @@ python scripts/run_pair.py \
   --output results/pair.json
 ```
 
-The D435i sequence mode uses two indices from one session:
+For a D435i sequence, select two frame indices:
 
 ```bash
 python scripts/run_pair.py \
   --session /mnt/e/path/to/session \
-  --reference-index 60 \
-  --query-index 260 \
+  --reference-index 80 \
+  --query-index 500 \
   --backend sift \
-  --reference-roi 180 155 410 470 \
-  --query-roi 180 155 440 470 \
   --output results/pair.json \
   --evidence-dir results/pair_evidence
 ```
 
-ROI coordinates use `(x0, y0, x1, y1)` with exclusive upper bounds. They mask
-feature extraction while retaining full-image keypoint coordinates; they do
-not crop or alter the RGB-D data. Separate reference and query rectangles are
-supported because viewpoint changes move the object.
+The evidence directory contains RGB/depth previews and match images. A
+rectangular ROI, polygon, or precomputed mask can be passed to restrict
+feature extraction. These inputs do not modify the RGB-D session.
 
-For a tighter manual object mask, pass polygon vertices as a flat sequence of
-`x y` values. The reference and query polygons may differ because the visible
-object silhouette can change:
+For example, a polygon is supplied as a flat `x y` sequence:
 
 ```bash
 python scripts/run_pair.py \
@@ -270,46 +209,90 @@ python scripts/run_pair.py \
   --output results/pair_polygon.json
 ```
 
-The polygon intersects a supplied rectangle when both are present. It masks
-feature extraction only; the original RGB-D files remain untouched.
+The tabletop mask helper fits a plane from manually selected table pixels and
+writes derived masks outside the session:
 
-## Real-data interpretation
+```bash
+python scripts/generate_tabletop_mask.py \
+  /mnt/e/path/to/session \
+  --frame-index 80 \
+  --plane-points 80 380 550 380 80 450 550 450 \
+  --object-roi 180 100 450 370 \
+  --output results/tabletop_mask/frame_080
+```
 
-The inspected `anime_box_small_turn` recording contains an initial static
-front-facing box, a hand-driven rotation interval, and a final static rotated
-box. A clean diagnostic pair was selected from frames `60` and `260`:
+Pass its `mask.png` outputs with `--reference-mask` and `--query-mask`. This
+is a tabletop foreground heuristic, not general object segmentation.
 
-| Metric | Reference 60 | Query 260 |
-|---|---:|---:|
-| RGB-depth timestamp difference | 9.199 ms | 9.063 ms |
-| Full-frame usable depth ratio | 94.25% | 94.56% |
-| ROI SIFT features | 357 | 375 |
-| Visual matches | — | 77 |
-| Valid 3D matches | — | 74 |
-| RANSAC inliers | — | 65 |
-| Inlier ratio | — | 0.8784 |
-| Weighted RMSE | — | 0.002723 m |
+### Optional DINOv2 backend
 
-This is a static-camera diagnostic with manually observed object motion. The
-manual rotation is not an independently measured pose, so the transform is
-not reported as a pose error or ground-truth evaluation. The fixed curtain and
-table can still produce raw SIFT matches, so a manually specified polygon mask
-is useful for diagnostics, but it is not automatic segmentation or benchmark
-ground truth.
+The DINOv2 path uses the same image-space ROI, polygon, and mask inputs. It is
+experimental and should be treated as a feature-matching diagnostic:
 
-## Limitations and scope
+```bash
+python scripts/run_pair.py \
+  --session /mnt/e/path/to/session \
+  --reference-index 80 \
+  --query-index 500 \
+  --backend dino \
+  --dino-model dinov2_vits14 \
+  --dino-device cuda \
+  --output results/dino_pair.json
+```
 
-- The confidence score is heuristic and not calibrated.
-- Rectangular ROIs and polygon masks are manual; automatic segmentation is not
-  implemented.
-- No ground-truth object pose is currently recorded.
-- Static-camera sequences are useful for parsing and sanity checks, not for a
-  viewpoint-change benchmark by themselves.
-- Low-texture surfaces, occlusion, object symmetries, and missing depth can
-  still produce plausible but incorrect correspondences.
-- DINOv2, Open3D, ROS, Gazebo, Isaac Sim, and a large benchmark are deliberately
-  deferred.
+CUDA is explicit; this command does not silently fall back to CPU. The first
+run may download the official DINOv2 repository and weights through
+`torch.hub`. Do not interpret a successful DINOv2 transform as pose accuracy
+without independent reference motion.
 
-The intended next research step is a controlled viewpoint-change capture with
-known camera/object motion or an independent fiducial/robotic reference, while
-keeping the screening gate ahead of all experiment ingestion.
+## Useful tools
+
+| Tool | Purpose |
+|---|---|
+| `inspect_realsense_sequence.py` | Decode one frame and save previews |
+| `validate_experiment_candidate.py` | Check recording or pair quality |
+| `export_motion_review.py` | Export sampled RGB/depth review sheets |
+| `approve_motion_review.py` | Record a human-reviewed frame pair |
+| `generate_tabletop_mask.py` | Create a scene-specific depth-plane mask |
+| `run_pair.py` | Run SIFT or DINOv2 correspondence and pose estimation |
+| `summarize_dino_quality.py` | Summarize an existing DINOv2 result |
+
+Motion scores and mask reports are aids for selecting data. They cannot tell
+whether a change came from a hand, object motion, lighting, or camera motion,
+and they do not create ground-truth labels.
+
+## Limitations
+
+- The confidence value is a transparent heuristic, not a calibrated probability.
+- Manual ROIs and polygons are currently supported; the tabletop mask is
+  scene-specific and heuristic.
+- Low texture, occlusion, object symmetry, and missing depth can create
+  plausible but incorrect correspondences.
+- Static-camera recordings are useful for parsing and smoke checks, not by
+  themselves for a viewpoint-change benchmark.
+- No independent object pose reference is currently available.
+- The weighted-vs-unweighted path is diagnostic code; this repository does not
+  claim a measured advantage for either estimator.
+- DINOv2 is experimental. DINOv3, large-scale benchmarking, Open3D, ROS,
+  Gazebo, and Isaac Sim are intentionally deferred.
+
+## Future plan
+
+The current manual-rotation collection is paused. The existing recordings are
+useful for validating parsing, synchronization, depth, masking, and feature
+matching, but they do not establish pose accuracy because the nominal rotation
+was not independently measured.
+
+When a better debugging setup is available, the next controlled experiment is:
+
+1. use a rigid fixture or turntable so the object motion is repeatable;
+2. record the intended angle and, if possible, an independent reference pose;
+3. keep any ArUco/AprilTag or fixture reference in a separate evaluation path,
+   rather than using it as a matching feature;
+4. compare the estimated relative `SE(3)` against that independent reference;
+5. only then draw conclusions about pose accuracy or weighted-vs-unweighted
+   performance.
+
+A single planar marker can disappear at large rotations, so the reference
+should be attached to a fixture or arranged with enough visible geometry for
+the required motion range.
